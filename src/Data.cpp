@@ -186,21 +186,115 @@ void Data::file_read_initialization() {
 /////////////////////////////////////////////////
 /////////////////////////////////////////////////
 
+#if defined(__GNUC__) && defined(EIGEN_VECTORIZE_SSE2)
+// makes x an opaque value held in a register, so -ffast-math cannot reassociate the operations around it
+#define L0_OPAQUE(x) __asm__ __volatile__("" : "+x"(x))
+#endif
+
+// (the order below is that of Eigen 3.4.0, so other Eigen versions use the Eigen expression)
+#if defined(L0_OPAQUE) && !defined(EIGEN_VECTORIZE_AVX) && !defined(__FMA__) && (EIGEN_WORLD_VERSION == 3) && (EIGEN_MAJOR_VERSION == 4) && (EIGEN_MINOR_VERSION == 0)
+#define L0_ROWNORM_SSE2
+// rows [r0,r1) (r1-r0 even) of G.rowwise().norm() * inv for a column-major nr x nc matrix, reading the columns
+// once (the Eigen expression sweeps each pair of rows across all nc columns). Each row adds its squares in the
+// order of Eigen's SSE2 packet reduction (packetwise_redux_impl in PartialReduxEvaluator.h): x_0^2, then
+// ((x_i^2 + x_i+1^2) + (x_i+2^2 + x_i+3^2)) for i = 1, 5, ... < (nc-1)&~3, then the remaining columns one by one
+static void scaled_row_norms_sse2(double const* G, Index const nr, Index const nc, Index const r0, Index const r1, double const inv, double* acc, double* out) {
+
+  Index const size4 = (nc - 1) & ~Index(3);
+  __m128d const vinv = _mm_set1_pd(inv);
+
+  for(Index r = r0; r < r1; r += 2) {
+    __m128d a = _mm_loadu_pd(G + r);
+    _mm_storeu_pd(acc + r, _mm_mul_pd(a, a));
+  }
+
+  Index i = 1;
+  for(; i < size4; i += 4) {
+    double const* c0 = G + i * nr;
+    for(Index r = r0; r < r1; r += 2) {
+      __m128d a = _mm_loadu_pd(c0 + r), b = _mm_loadu_pd(c0 + nr + r), c = _mm_loadu_pd(c0 + 2 * nr + r), d = _mm_loadu_pd(c0 + 3 * nr + r);
+      __m128d s1 = _mm_add_pd(_mm_mul_pd(a, a), _mm_mul_pd(b, b));
+      L0_OPAQUE(s1);
+      __m128d s2 = _mm_add_pd(_mm_mul_pd(c, c), _mm_mul_pd(d, d));
+      L0_OPAQUE(s2);
+      __m128d t = _mm_add_pd(s1, s2);
+      L0_OPAQUE(t);
+      __m128d p = _mm_add_pd(_mm_loadu_pd(acc + r), t);
+      L0_OPAQUE(p);
+      _mm_storeu_pd(acc + r, p);
+    }
+  }
+  for(; i < nc; i++) {
+    double const* c0 = G + i * nr;
+    for(Index r = r0; r < r1; r += 2) {
+      __m128d a = _mm_loadu_pd(c0 + r);
+      a = _mm_mul_pd(a, a);
+      L0_OPAQUE(a);
+      __m128d p = _mm_add_pd(_mm_loadu_pd(acc + r), a);
+      L0_OPAQUE(p);
+      _mm_storeu_pd(acc + r, p);
+    }
+  }
+
+  // the quotient by a constant is compiled as a product by its inverse (sqrtpd, mulpd)
+  for(Index r = r0; r < r1; r += 2)
+    _mm_storeu_pd(out + r, _mm_mul_pd(_mm_sqrt_pd(_mm_loadu_pd(acc + r)), vinv));
+}
+#endif
+
 // only for step 1
 void Data::residualize_genotypes() {
 
   sout << "   -residualizing and scaling genotypes..." << flush;
   auto t1 = std::chrono::high_resolution_clock::now();
+  int const bs = Gblock.Gmat.rows();
+  int const nsamp = Gblock.Gmat.cols();
 
-  // mask missing individuals
-  Gblock.Gmat.array().rowwise() *= in_filters.ind_in_analysis.matrix().transpose().array().cast<double>();
+  // mask missing individuals (the bed reader already writes 0 for them)
+  if(params.file_type != "bed")
+    Gblock.Gmat.array().rowwise() *= in_filters.ind_in_analysis.matrix().transpose().array().cast<double>();
 
   // residuals (centered)
   MatrixXd beta = Gblock.Gmat * pheno_data.new_cov;
-  Gblock.Gmat -= beta * pheno_data.new_cov.transpose();
+  if(params.threads == 1) {
+    // Gmat -= beta * new_cov^T one panel of columns at a time: the panel's product is evaluated like the
+    // bs x N temporary of the whole product (zeroed, then one gemm) into a small buffer, which is still in
+    // cache when it is subtracted (no bs x N temporary, its page faults and extra passes over memory).
+    // Only with one thread: a threaded BLAS splits the whole product differently from the panels
+    int const pw = 192 * std::max(1, 262144 / (192 * std::max(bs, 1)));
+    int const npanel = std::max(1, nsamp / pw);
+    MatrixXd prod;
+    for(int p = 0; p < npanel; p++) {
+      int const c0 = p * pw, nc = (p < (npanel - 1)) ? pw : (nsamp - c0);
+      prod.noalias() = beta * pheno_data.new_cov.middleRows(c0, nc).transpose();
+      Gblock.Gmat.middleCols(c0, nc) -= prod;
+    }
+  } else
+    Gblock.Gmat -= beta * pheno_data.new_cov.transpose();
 
   // scaling (use [N-C] where C=#covariates)
-  scale_G = Gblock.Gmat.rowwise().norm() / sqrt(params.n_analyzed - params.ncov);
+  bool norm_done = false;
+#if defined(L0_ROWNORM_SSE2)
+  if( ((bs % 2) == 0) && (nsamp > 0) ) {
+    // same values as the expression below, which multiplies by 1/sqrt(N-C) (computed with divsd)
+    double scl = sqrt(params.n_analyzed - params.ncov);
+    L0_OPAQUE(scl);
+    double inv = 1.0 / scl;
+    L0_OPAQUE(inv);
+    VectorXd ssq(bs);
+    scale_G.resize(bs);
+    // each thread owns a strip of rows, so every row keeps its order of additions
+    int const npairs = bs / 2, nstrip = std::max(1, std::min(params.threads, npairs));
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for(int t = 0; t < nstrip; t++)
+      scaled_row_norms_sse2(Gblock.Gmat.data(), bs, nsamp, 2 * ((npairs * (Index) t) / nstrip), 2 * ((npairs * (Index) (t + 1)) / nstrip), inv, ssq.data(), scale_G.data());
+    norm_done = true;
+  }
+#endif
+  if(!norm_done)
+    scale_G = Gblock.Gmat.rowwise().norm() / sqrt(params.n_analyzed - params.ncov);
 
   // check sd
   MatrixXd::Index minIndex;
@@ -208,7 +302,33 @@ void Data::residualize_genotypes() {
     throw "!! Uh-oh, SNP " + snpinfo[in_filters.step1_snp_count+minIndex].ID + 
       " has low variance (=" + to_string( scale_G(minIndex,0) ) + ").";
 
+#if defined(L0_OPAQUE)
+  // elementwise divisions (divpd as in the Eigen loop), split over columns; the opaque
+  // divisors keep the compiler from turning them into products by reciprocals
+  int const nchunk = std::max(1, std::min(params.threads, nsamp));
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+  for(int t = 0; t < nchunk; t++) {
+    double const* sc = scale_G.data();
+    for(Index col = (nsamp * (Index) t) / nchunk; col < (nsamp * (Index) (t + 1)) / nchunk; col++) {
+      double* x = Gblock.Gmat.data() + col * bs;
+      int r = 0;
+      for(; r + 1 < bs; r += 2) {
+        __m128d s = _mm_loadu_pd(sc + r);
+        L0_OPAQUE(s);
+        _mm_storeu_pd(x + r, _mm_div_pd(_mm_loadu_pd(x + r), s));
+      }
+      for(; r < bs; r++) {
+        double s = sc[r];
+        L0_OPAQUE(s);
+        x[r] = x[r] / s;
+      }
+    }
+  }
+#else
   Gblock.Gmat.array().colwise() /= scale_G.array();
+#endif
 
   // to use MAF dependent prior on effect size [only for step 1]
   // multiply by [p*(1-p)]^(1+alpha)/2
@@ -735,6 +855,9 @@ void Data::calc_cv_matrices(struct ridgel0* l0) {
 
   if(!params.use_loocv){ // k-fold
 
+    // the Cholesky path of ridge_level_0 reads only the lower triangles,
+    // while the eigen path and test_assoc_block use the full matrices
+    bool const lower_only = l0_lower_only(params);
     l0->GGt.setZero(bs,bs);
     l0->GTY.setZero(bs,params.n_pheno);
     uint32_t cum_size_folds = 0;
@@ -748,8 +871,12 @@ void Data::calc_cv_matrices(struct ridgel0* l0) {
       l0->GTY += l0->GtY[i];
       l0->G_folds[i].setZero(bs,bs);
       l0->G_folds[i].selfadjointView<Lower>().rankUpdate(Gmat); // symmetric product: half the flops of Gmat * Gmat^t
-      l0->G_folds[i].triangularView<Eigen::Upper>() = l0->G_folds[i].transpose(); // fill upper-triangular part
-      l0->GGt += l0->G_folds[i];
+      if(lower_only)
+        l0->GGt.triangularView<Eigen::Lower>() += l0->G_folds[i];
+      else {
+        l0->G_folds[i].triangularView<Eigen::Upper>() = l0->G_folds[i].transpose(); // fill upper-triangular part
+        l0->GGt += l0->G_folds[i];
+      }
       cum_size_folds += params.cv_sizes(i);
     }
     

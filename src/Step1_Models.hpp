@@ -87,6 +87,10 @@ double get_poisson_dev(const Eigen::Ref<const Eigen::ArrayXd>& Y, const Eigen::R
 void fit_null_cox(bool const&, const int&, struct param*, struct phenodt*, struct ests*, struct in_files*, mstream&, bool const& save_betas = false);
 double getCoxLambdaMax(const Eigen::MatrixXd&, const Eigen::VectorXd&);
 
+// level 0 ridge with one Cholesky solve per ridge parameter, which reads only the lower triangles of GGt and G_folds
+inline bool l0_use_chol(struct param const& params) { return params.n_ridge_l0 <= 20; }
+// k-fold level 0 matrices kept as lower triangles only (when nothing reads their upper triangles)
+inline bool l0_lower_only(struct param const& params) { return !params.use_loocv && !params.test_l0 && l0_use_chol(params); }
 void ridge_level_0(const int&,struct in_files*,struct param*,struct filter*,struct ests*,struct geno_block*,struct phenodt*,std::vector<snp>&,struct ridgel0*,struct ridgel1*,std::vector<MatrixXb>&,mstream&);
 void ridge_level_0_loocv(const int,struct in_files*,struct param*,struct filter*,struct ests*,struct geno_block*,struct phenodt*,std::vector<snp>&,struct ridgel0*,struct ridgel1*,mstream&);
 void write_l0_file(std::ofstream*,Eigen::MatrixXd&,mstream&);

@@ -1705,20 +1705,147 @@ void readChunkFromBGENFileToG_fast(const int& bs, const int& chrom, const uint32
 // only for step 1
 void readChunkFromBedFileToG(const int& bs, const int& chrom, const uint32_t& snpcount, vector<snp> const& snpinfo, struct param const* params, struct in_files* files, struct geno_block* gblock, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, mstream& sout) {
 
-  int const nbl = files->bed_data_blocks.size();
   uint32_t const nmax = filters->ind_ignore.size();
+  uint64 const bbs = files->bed_block_size;
+  int const nsamp = params->n_samples;
 
-  // allocate memory if needed
-  if( nbl < bs ){
-    files->bed_data_blocks.resize(bs);
-    for (int i = nbl; i < bs; i++)
-      files->bed_data_blocks[i].resize(files->bed_block_size);
-  }
-  // read in N/4 bytes from bed file for each snp
-  for(int j = 0; j < bs; j++) {
+  // read in N/4 bytes from bed file for each snp (snp j at j * bed_block_size in one buffer),
+  // with one read for each run of snps that are consecutive in the file
+  if(files->bed_data_blocks.size() < 1) files->bed_data_blocks.resize(1);
+  vector<uchar>& bed_buf = files->bed_data_blocks[0];
+  if(bed_buf.size() < bs * bbs) bed_buf.resize(bs * bbs);
+  for(int j = 0, k; j < bs; j = k) {
+    for(k = j + 1; (k < bs) && (snpinfo[snpcount + k].offset == (snpinfo[snpcount + k - 1].offset + 1)); k++);
     // set to correct position
-    jumpto_bed( snpinfo[snpcount + j].offset, files->bed_block_size, files->geno_ifstream);
-    files->geno_ifstream.read( reinterpret_cast<char *> (&files->bed_data_blocks[j][0]), files->bed_block_size);
+    jumpto_bed( snpinfo[snpcount + j].offset, bbs, files->geno_ifstream);
+    files->geno_ifstream.read( reinterpret_cast<char *> (&bed_buf[j * bbs]), (k - j) * bbs);
+  }
+  uchar const* const bed = bed_buf.data();
+
+  // bed position of each sample kept in memory, and for each bed byte a mask with bits 11 for the samples in the analysis
+  vector<uint32_t> bed_pos(nsamp);
+  vector<uchar> in_mask(bbs, 0);
+  int nkept = 0;
+  for(uint32_t i = 0; i < nmax; i++) {
+    if( filters->ind_ignore(i) ) continue;
+    if(nkept < nsamp) {
+      bed_pos[nkept] = i;
+      if( filters->ind_in_analysis(nkept) ) in_mask[i >> 2] |= 3 << ((i & 3) << 1);
+    }
+    nkept++;
+  }
+
+  // (the writes below address Gmat as a contiguous bs x n_samples matrix)
+  if( (nkept == nsamp) && (gblock->Gmat.rows() == bs) && (gblock->Gmat.cols() == nsamp) ) {
+
+    int const nvar = bs; // local copy: bs is a reference, which every byte store below could alias
+
+    // for each byte value (4 samples): number of non-missing genotypes + (sum of the genotypes << 32)
+    uint64 lut_ns[256];
+    for(int b = 0; b < 256; b++) {
+      lut_ns[b] = 0;
+      for(int bit_start = 0; bit_start < 4; bit_start++) {
+        int hc = params->bed_lookup_table[b](bit_start);
+        if(hc == -3) continue;
+        if(params->ref_first) hc = 2 - hc;
+        lut_ns[b] += 1 + ((uint64) hc << 32);
+      }
+    }
+
+    // value written for each 2-bit code {hom. alt, missing, het, hom. ref}, with the snp mean for missing
+    vector<double> geno_val(4 * (size_t) nvar);
+    double* const gval = geno_val.data();
+    uchar const* const mask = in_mask.data();
+
+#if defined(_OPENMP)
+    setNbThreads(1);
+#pragma omp parallel for schedule(static)
+#endif
+    for(int j = 0; j < nvar; j++) {
+
+      // samples not in the analysis are set to the missing code (01) before the lookup
+      uchar const* g = bed + j * bbs;
+      uint64 acc = 0;
+      for(uint64 b = 0; b < bbs; b++)
+        acc += lut_ns[ (g[b] & mask[b]) | (0x55 & ~mask[b]) ];
+      int const ns = acc & 0xffffffff;
+      // all partial sums are integers, so this is the same double as adding the genotypes one by one
+      double total = (double) (acc >> 32);
+      total /= ns;
+      if(params->alpha_prior != -1) gblock->snp_afs(j, 0) = total / 2;
+
+      gval[4 * j] = params->ref_first ? 0 : 2;
+      gval[4 * j + 1] = total;
+      gval[4 * j + 2] = 1;
+      gval[4 * j + 3] = params->ref_first ? 2 : 0;
+    }
+
+    // write genotypes and impute missing (as mean_impute_g): each task owns a tile of samples,
+    // transposes their 2-bit codes and then writes whole (contiguous) columns of Gmat
+    int const ntile = 64;
+    double* const gmat = gblock->Gmat.data();
+    uint32_t const* const pos = bed_pos.data();
+#if defined(EIGEN_VECTORIZE_SSE2)
+    // streaming stores when Gmat is much larger than the cache (needs 16-byte aligned columns)
+    bool const use_nt = ((nvar % 2) == 0) && ((((size_t) gmat) & 15) == 0) && ((double) nvar * nsamp > 4e6);
+#endif
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for(int s0 = 0; s0 < nsamp; s0 += ntile) {
+
+      int const nt = std::min(ntile, nsamp - s0);
+      static thread_local vector<uchar> codes;
+      if(codes.size() < (size_t) ntile * nvar) codes.resize((size_t) ntile * nvar);
+      uchar* const cd = codes.data();
+
+      if( ((pos[s0] & 3) == 0) && (pos[s0 + nt - 1] - pos[s0] == (uint32_t) (nt - 1)) && ((nt & 3) == 0) ) {
+        // samples are consecutive in the bed file: 4 samples per byte
+        for(int j = 0; j < nvar; j++) {
+          uchar const* g = bed + j * bbs + (pos[s0] >> 2);
+          for(int k = 0; k < nt; k += 4) {
+            uchar const x = g[k >> 2];
+            cd[k * nvar + j] = x & 3;
+            cd[(k + 1) * nvar + j] = (x >> 2) & 3;
+            cd[(k + 2) * nvar + j] = (x >> 4) & 3;
+            cd[(k + 3) * nvar + j] = (x >> 6) & 3;
+          }
+        }
+      } else {
+        for(int j = 0; j < nvar; j++) {
+          uchar const* g = bed + j * bbs;
+          for(int k = 0; k < nt; k++) {
+            uint32_t const i = pos[s0 + k];
+            cd[k * nvar + j] = (g[i >> 2] >> ((i & 3) << 1)) & 3;
+          }
+        }
+      }
+
+      for(int k = 0; k < nt; k++) {
+        double* out = gmat + (size_t) (s0 + k) * nvar;
+        if( !filters->ind_in_analysis(s0 + k) ) {
+          for(int j = 0; j < nvar; j++) out[j] = 0;
+          continue;
+        }
+        uchar const* c = cd + k * nvar;
+        int j = 0;
+#if defined(EIGEN_VECTORIZE_SSE2)
+        if(use_nt)
+          for(; j + 1 < nvar; j += 2)
+            _mm_stream_pd(out + j, _mm_set_pd(gval[4 * (j + 1) + c[j + 1]], gval[4 * j + c[j]]));
+#endif
+        for(; j < nvar; j++) out[j] = gval[4 * j + c[j]];
+      }
+#if defined(EIGEN_VECTORIZE_SSE2)
+      if(use_nt) _mm_sfence();
+#endif
+    }
+
+#if defined(_OPENMP)
+    setNbThreads(params->threads);
+#endif
+    return;
   }
 
   // Gmat is stored variant x sample, so the values of consecutive variants for one sample share a cache line:
@@ -1748,7 +1875,7 @@ void readChunkFromBedFileToG(const int& bs, const int& chrom, const uint32_t& sn
 
       for (size_t byte_start = 0; byte_start < files->bed_block_size; byte_start++) {
 
-        uchar const byte = files->bed_data_blocks[j][byte_start];
+        uchar const byte = bed[j * bbs + byte_start];
 
         for(int bit_start = 0; bit_start < 4; bit_start++, i++){
 

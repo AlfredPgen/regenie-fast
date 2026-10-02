@@ -459,6 +459,29 @@ double getCoxLambdaMax(const Eigen::MatrixXd& Xmat, const Eigen::VectorXd& gradi
 /////////////////////////////////////////////////
 /////////////////////////////////////////////////
 
+// b = (G^tG + sI)^(-1) GtY for fold i: factors the lower triangle that LLT<MatrixXd>(GGt - G_folds[i] + sI) would
+// factor, with the same LAPACKE_dpotrf (NaN check included) and the same two dtrsm calls as LLT::solve, but without
+// LLT's full copy of the matrix and its unused L1 norm (ww is a bs x bs work matrix, only its lower triangle is used)
+static bool ridge_l0_chol_solve(struct ridgel0 const* l0, int const& i, double const& lambda, MatrixXd& ww, MatrixXd& beta) {
+
+  ww.triangularView<Lower>() = l0->GGt - l0->G_folds[i];
+  ww.diagonal().array() += lambda;
+#if defined(EIGEN_USE_LAPACKE)
+  if( LAPACKE_dpotrf(LAPACK_COL_MAJOR, 'L', ww.rows(), ww.data(), ww.outerStride()) != 0 )
+    return false;
+  MatrixXd const& llt_l = ww;
+  beta = l0->GTY - l0->GtY[i];
+  llt_l.triangularView<Lower>().solveInPlace(beta);
+  llt_l.adjoint().triangularView<Upper>().solveInPlace(beta);
+#else
+  LLT<MatrixXd> llt(ww);
+  if(llt.info() != Eigen::Success)
+    return false;
+  beta = llt.solve(l0->GTY - l0->GtY[i]);
+#endif
+  return true;
+}
+
 void ridge_level_0(const int& block, struct in_files* files, struct param* params, struct filter* filters, struct ests* m_ests, struct geno_block* Gblock, struct phenodt* pheno_data, vector<snp>& snpinfo, struct ridgel0* l0, struct ridgel1* l1, vector<MatrixXb>& masked_in_folds, mstream& sout) {
 
   sout << "   -calc level 0 ridge..." << flush;
@@ -469,8 +492,7 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
   string op_name, out_pheno;
   ofstream ofile;
 
-  MatrixXd ww1, ww2, beta, pred, vmat, dvec, Xout;
-  MatrixXd ident_l0 = MatrixXd::Identity(bs, bs);
+  MatrixXd ww1, ww2, beta, pred, vmat, dvec;
   MatrixXd p_sum = MatrixXd::Zero(params->n_ridge_l0, params->n_pheno);
   MatrixXd p_sum2 = MatrixXd::Zero(params->n_ridge_l0, params->n_pheno);
 
@@ -480,20 +502,44 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
         params->beta_print_out[ph] = MatrixXd::Zero(params->n_ridge_l0, bs);
   }
 
+  // with few ridge parameters, one Cholesky solve per parameter (~bs^3/3 flops each)
+  // is much cheaper than a full eigendecomposition (~9 bs^3 flops)
+  bool const use_chol = l0_use_chol(*params);
+  int const nr = params->n_ridge_l0;
+  vector<MatrixXd> betas_chol, preds_chol;
+  if(use_chol) ww1.resize(bs, bs);
+
   uint32_t cum_size_folds = 0;
   for(int i = 0; i < params->cv_folds; ++i ) {
     // assign masking within folds
     masked_in_folds[i] = pheno_data->masked_indivs.block(cum_size_folds, 0, params->cv_sizes(i), pheno_data->masked_indivs.cols());
+    int const nk = params->cv_sizes(i);
 
-    ww1 = l0->GGt - l0->G_folds[i];
-    // with few ridge parameters, one Cholesky solve per parameter (~bs^3/3 flops each)
-    // is much cheaper than a full eigendecomposition (~9 bs^3 flops)
-    bool use_chol = params->n_ridge_l0 <= 20;
-    VectorXd diag_ww1;
+    // with one thread, beta^T * G for all ridge parameters one panel of the fold's columns at a time, so that G is
+    // read once from memory; each product has the shape of the whole-fold product except for its number of columns
+    // (panels are multiples of 192 columns, the last one takes the remainder). The whole-fold product is kept with
+    // more threads (a threaded BLAS splits it differently) and when the panels' outputs would need much memory
+    bool const pred_panels = use_chol && (params->threads == 1) && ((double) nr * l0->GTY.cols() * nk * sizeof(double) <= 256e6);
+
     if(use_chol) {
-      diag_ww1 = ww1.diagonal();
-      ww2 = l0->GTY - l0->GtY[i];
+      if(pred_panels) {
+        betas_chol.resize(nr);
+        preds_chol.resize(nr);
+        for(int j = 0; j < nr; ++j ) {
+          if( !ridge_l0_chol_solve(l0, i, params->lambda(j), ww1, betas_chol[j]) )
+            throw "Cholesky factorization failed in level 0 ridge (block " + to_string(block + 1) + ")";
+          preds_chol[j].resize(betas_chol[j].cols(), nk);
+        }
+        int const pw = 192 * std::max(1, 262144 / (192 * std::max(bs, 1)));
+        int const npanel = std::max(1, nk / pw);
+        for(int p = 0; p < npanel; p++) {
+          int const c0 = p * pw, nc = (p < (npanel - 1)) ? pw : (nk - c0);
+          for(int j = 0; j < nr; j++)
+            preds_chol[j].middleCols(c0, nc).noalias() = betas_chol[j].transpose() * Gblock->Gmat.block(0, cum_size_folds + c0, bs, nc);
+        }
+      }
     } else {
+      ww1 = l0->GGt - l0->G_folds[i];
       SelfAdjointEigenSolver<MatrixXd> eig(ww1);
       vmat = eig.eigenvectors();
       dvec = eig.eigenvalues();
@@ -504,24 +550,24 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     for(int j = 0; j < params->n_ridge_l0; ++j ) {
 
       if(use_chol) {
-        // b = (G^tG + sI)^(-1) GtY
-        ww1.diagonal() = diag_ww1.array() + params->lambda(j);
-        LLT<MatrixXd> llt(ww1);
-        if(llt.info() != Eigen::Success)
+        if( !pred_panels && !ridge_l0_chol_solve(l0, i, params->lambda(j), ww1, beta) )
           throw "Cholesky factorization failed in level 0 ridge (block " + to_string(block + 1) + ")";
-        beta = llt.solve(ww2);
       } else
         // b = U (D+sI)^(-1) U^t GtY
         beta = vmat * (dvec.array() + params->lambda(j)).inverse().matrix().asDiagonal() * ww2;
+      MatrixXd const& beta_ij = pred_panels ? betas_chol[j] : beta;
 
       // save beta for each phenotype (only when using out-of-sample pred)
       if(!params->within_sample_l0 && params->print_block_betas)
         for(int ph = 0; ph < params->n_pheno; ++ph ) 
           if( params->pheno_pass(ph) )
-            params->beta_print_out[ph].row(j) += beta.col(ph).transpose();
+            params->beta_print_out[ph].row(j) += beta_ij.col(ph).transpose();
 
       // out-of-sample predictions (mask missing)
-      pred = ( (beta.transpose() * Gblock->Gmat.block(0, cum_size_folds, bs, params->cv_sizes(i))).array()  * masked_in_folds[i].transpose().array().cast<double>() ).matrix();
+      if(pred_panels)
+        pred = ( preds_chol[j].array() * masked_in_folds[i].transpose().array().cast<double>() ).matrix();
+      else
+        pred = ( (beta.transpose() * Gblock->Gmat.block(0, cum_size_folds, bs, params->cv_sizes(i))).array()  * masked_in_folds[i].transpose().array().cast<double>() ).matrix();
       p_sum.row(j) += pred.rowwise().sum();
       p_sum2.row(j) += pred.rowwise().squaredNorm();
 
@@ -569,8 +615,6 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     if(params->print_block_betas)
       params->beta_print_out[ph].array().colwise() *= p_invsd.transpose().array();
 
-    if(params->write_l0_pred) Xout = MatrixXd::Zero(params->n_samples, params->n_ridge_l0);
-
     cum_size_folds = 0;
     for(int i = 0; i < params->cv_folds; ++i ) {
       if( params->trait_mode != 3){
@@ -580,21 +624,24 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
         l1->test_mat_conc[ph].block(cum_size_folds, block_eff * params->n_ridge_l0, params->cv_sizes(i), params->n_ridge_l0).rowwise() -= p_mean;
         l1->test_mat_conc[ph].block(cum_size_folds, block_eff * params->n_ridge_l0, params->cv_sizes(i), params->n_ridge_l0).array().rowwise() *= p_invsd.array();
       }
-
-      if(params->write_l0_pred) {
-        if (params->trait_mode != 3) {
-          Xout.block(cum_size_folds, 0, params->cv_sizes(i), params->n_ridge_l0) = l1->test_mat[ph][i].block(0, block_eff * params->n_ridge_l0, params->cv_sizes(i), params->n_ridge_l0);
-        } else {
-          Xout.block(cum_size_folds, 0, params->cv_sizes(i), params->n_ridge_l0) = l1->test_mat_conc[ph].block(cum_size_folds, block_eff * params->n_ridge_l0, params->cv_sizes(i), params->n_ridge_l0);
-        }
-      }
       cum_size_folds += params->cv_sizes(i);
     }
 
-    // write predictions to file if specified
+    // write predictions to file if specified: the bytes of the column-major n_samples x n_ridge_l0 matrix,
+    // written column by column and fold by fold (no copy into a zeroed matrix)
     if(params->write_l0_pred) {
-      write_l0_file(files->write_preds_files[ph].get(), Xout, sout);
-      //if(block ==0 && ph == 0 ) sout << endl << "Out " << endl <<  Xout.block(0, 0, 3, 3) << endl;
+      ofstream* ofs = files->write_preds_files[ph].get();
+      for(int j = 0; j < params->n_ridge_l0; ++j ) {
+        cum_size_folds = 0;
+        for(int i = 0; i < params->cv_folds; ++i ) {
+          double const* pcol = (params->trait_mode != 3) ? l1->test_mat[ph][i].col(block_eff * params->n_ridge_l0 + j).data() :
+            l1->test_mat_conc[ph].col(block_eff * params->n_ridge_l0 + j).data() + cum_size_folds;
+          ofs->write( reinterpret_cast<char const*> (pcol), params->cv_sizes(i) * sizeof(double) );
+          cum_size_folds += params->cv_sizes(i);
+        }
+      }
+      if( ofs->fail() )
+        throw "cannot successfully write temporary level 0 predictions to disk";
     }
 
   }
