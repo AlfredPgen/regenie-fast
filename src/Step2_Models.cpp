@@ -233,7 +233,162 @@ void compute_score(int const& isnp, int const& snp_index, int const& chrom, int 
   }
 }
 
-// MCC test stat for QT 
+// closed-form score tests (see cf_block in Step2_Models.hpp): standard single-variant QT/BT tests only
+bool cf_supported(struct param const& params){
+  return ((params.trait_mode == 0) || (params.trait_mode == 1)) && !params.build_mask && !params.snp_set && !params.joint_test &&
+    !params.w_interaction && !params.mcc_test && !params.skip_cov_res && !params.getCorMat &&
+    !params.skip_scaleG && !params.trait_set && !params.multiphen;
+}
+
+// known vectors of the block product S = W^T G and the matching constants
+void cf_prepare(cf_block& cf, const Ref<const MatrixXd>& yres, const Ref<const ArrayXb>& ind_in_analysis, struct param const& params, struct phenodt const& pheno_data, struct ests const& m_ests){
+
+  int const P = params.n_pheno;
+  Index const N = params.n_samples;
+  cf.n_pheno = P;
+  cf.trait_mode = params.trait_mode;
+
+  if(params.trait_mode == 0){
+
+    MatrixXd const& X = pheno_data.new_cov;
+    int const C = X.cols();
+    cf.ncov = C;
+
+    // centering vector: analysis indicator or all-ones, whichever lies in the span of the covariates
+    cf.center = false;
+    for(int k = 0; k < 2 && !cf.center; k++){
+      VectorXd v = (k == 0) ? VectorXd(ind_in_analysis.cast<double>().matrix()) : VectorXd::Ones(N);
+      VectorXd proj = v - X * (X.transpose() * v);
+      if(proj.squaredNorm() <= 1e-20 * v.squaredNorm()) { cf.e = v; cf.center = true; }
+    }
+    if(!cf.center) cf.e = VectorXd::Zero(N);
+    cf.ete = cf.center ? cf.e.squaredNorm() : 1;
+
+    MatrixXd mask_d = pheno_data.masked_indivs.cast<double>();
+    cf.mask_t = mask_d.transpose();
+    cf.W.resize(N, 1 + C + C * P + P);
+    cf.W.col(0) = cf.e;
+    cf.W.middleCols(1, C) = X;
+    cf.Xpte.resize(P);
+    cf.XptXp.resize(P);
+    for(int p = 0; p < P; p++){
+      auto Xp = cf.W.middleCols(1 + C + p * C, C);
+      Xp = mask_d.col(p).asDiagonal() * X;
+      cf.Xpte[p] = Xp.transpose() * cf.e;
+      cf.XptXp[p] = Xp.transpose() * Xp;
+    }
+    cf.W.rightCols(P) = yres;
+    cf.Xte = X.transpose() * cf.e;
+    cf.XtX = X.transpose() * X;
+    cf.Yte = yres.transpose() * cf.e;
+    cf.YtX = yres.transpose() * X;
+
+  } else {
+
+    cf.col.assign(P, -1);
+    cf.ncov_p.assign(P, 0);
+    cf.center_p.assign(P, false);
+    cf.g2_sum.assign(P, 1);
+    cf.gy.assign(P, 0);
+    cf.Xwg.resize(P);
+    cf.Xwy.resize(P);
+    cf.XwtXw.resize(P);
+
+    int K = 0;
+    for(int p = 0; p < P; p++){
+      if(!params.pheno_pass(p)) continue;
+      cf.col[p] = K;
+      cf.ncov_p[p] = m_ests.X_Gamma[p].cols();
+      K += cf.ncov_p[p] + 2;
+    }
+    cf.W.resize(N, K);
+
+    for(int p = 0; p < P; p++){
+      if(cf.col[p] < 0) continue;
+      int const o = cf.col[p], Cp = cf.ncov_p[p];
+      MapcMatXd Xw (m_ests.X_Gamma[p].data(), N, Cp);
+      VectorXd gam = m_ests.Gamma_sqrt_mask.col(p);
+      cf.W.col(o) = gam.array().square().matrix();
+      cf.W.middleCols(o + 1, Cp) = gam.asDiagonal() * Xw;
+      cf.W.col(o + 1 + Cp) = (gam.array() * yres.col(p).array()).matrix();
+      VectorXd proj = gam - Xw * (Xw.transpose() * gam);
+      cf.center_p[p] = proj.squaredNorm() <= 1e-20 * gam.squaredNorm();
+      cf.g2_sum[p] = gam.squaredNorm();
+      cf.Xwg[p] = Xw.transpose() * gam;
+      cf.gy[p] = gam.dot(yres.col(p));
+      cf.XwtXw[p] = Xw.transpose() * Xw;
+      cf.Xwy[p] = Xw.transpose() * yres.col(p);
+    }
+
+  }
+
+  cf.active = true;
+}
+
+// score numerator and variance of one dense variant from its column of S (one pass over the samples)
+void cf_variant(cf_block const& cf, int const& isnp, const Ref<const ArrayXd>& Geno, variant_block* block_info, struct data_thread* dt_thr, struct param const& params, struct ests const& m_ests){
+
+  int const P = cf.n_pheno;
+  Index const N = Geno.size();
+  auto const s = cf.S.col(isnp);
+  dt_thr->cf_num = ArrayXd::Zero(P);
+  dt_thr->cf_denum = ArrayXd::Zero(P);
+
+  if(cf.trait_mode == 0){
+
+    int const C = cf.ncov;
+    double const mu = cf.center ? s(0) / cf.ete : 0;
+    VectorXd const b = s.segment(1, C) - mu * cf.Xte; // X^T c
+
+    // sum of squares of c = g - mu e, over all samples and within each trait mask
+    double ss = 0;
+    ArrayXd q = ArrayXd::Zero(P);
+    for(Index i = 0; i < N; i++){
+      double const ci = Geno(i) - mu * cf.e(i);
+      double const c2 = ci * ci;
+      ss += c2;
+      for(int p = 0; p < P; p++) q(p) += cf.mask_t(p, i) * c2;
+    }
+
+    // scale of the residualized genotype (as in residualize_geno)
+    double const rr = ss - 2 * b.squaredNorm() + b.dot(cf.XtX * b);
+    block_info->scale_fac = sqrt(std::max(rr, 0.0)) / sqrt(params.n_analyzed - C);
+    if( block_info->scale_fac < params.numtol ) {
+      block_info->ignored = true;
+      return;
+    }
+
+    for(int p = 0; p < P; p++){
+      VectorXd const Xpc = s.segment(1 + C + p * C, C) - mu * cf.Xpte[p];
+      dt_thr->cf_num(p) = (s(1 + C + C * P + p) - mu * cf.Yte(p)) - cf.YtX.row(p).dot(b);
+      dt_thr->cf_denum(p) = q(p) - 2 * b.dot(Xpc) + b.dot(cf.XptXp[p] * b);
+    }
+
+  } else {
+
+    for(int p = 0; p < P; p++){
+      if(cf.col[p] < 0) continue;
+      int const o = cf.col[p], Cp = cf.ncov_p[p];
+      MapcArXd gam (m_ests.Gamma_sqrt_mask.col(p).data(), N);
+      double const mu = cf.center_p[p] ? s(o) / cf.g2_sum[p] : 0;
+      VectorXd const b = s.segment(o + 1, Cp) - mu * cf.Xwg[p]; // X_Gamma^T Gamma^1/2 c
+
+      double q = 0;
+      for(Index i = 0; i < N; i++){
+        double const d = gam(i) * (Geno(i) - mu);
+        q += d * d;
+      }
+
+      dt_thr->cf_denum(p) = q - 2 * b.squaredNorm() + b.dot(cf.XwtXw[p] * b);
+      dt_thr->cf_num(p) = (s(o + 1 + Cp) - mu * cf.gy[p]) - b.dot(cf.Xwy[p]);
+    }
+
+  }
+
+  dt_thr->cf_ready = true;
+}
+
+// MCC test stat for QT
 void compute_score_qt_mcc(int const& isnp, int const& snp_index, int const& thread_num, string const& test_string, string const& model_type, const Ref<const MatrixXd>& yres, const Ref<const RowVectorXd>& p_sd_yres, struct param const& params, struct phenodt& pheno_data, struct geno_block& gblock, variant_block* block_info, vector<snp> const& snpinfo, struct in_files& files, mstream& sout){
 
   double gsc = block_info->flipped ? (4 * params.n_samples + block_info->scale_fac) : block_info->scale_fac;
@@ -383,7 +538,8 @@ void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_n
         num = yres.transpose() * dt_thr->Gsparse - pheno_data.YtX * XtG.matrix();
         denum = dt_thr->Gsparse.squaredNorm() - XtG.square().sum();
       } else {
-        num = (yres.transpose() * Geno.matrix()).array() * gsc;
+        if(dt_thr->cf_ready) num = dt_thr->cf_num; // same quantity from block statistics (cf_variant)
+        else num = (yres.transpose() * Geno.matrix()).array() * gsc;
         denum = gsc * gsc * (params.n_analyzed - params.ncov_analyzed); 
       }
 
@@ -411,9 +567,12 @@ void compute_score_qt(int const& isnp, int const& snp_index, int const& thread_n
           //VectorXd vm = (pheno_data.new_cov * XtG).cwiseProduct(pheno_data.masked_indivs.col(ph).cast<double>());
           //denum_arr(ph) = Gm.squaredNorm() - 2 * XtGm.dot(XtG) + vm.squaredNorm(); // correct callculation but more expensive
         }
+      } else if(dt_thr->cf_ready) { // same quantities from block statistics (cf_variant)
+        num = dt_thr->cf_num;
+        denum_arr = dt_thr->cf_denum;
       } else {
         num = (yres.transpose() * Geno.matrix()).array() * gsc;
-        denum_arr = gsc * gsc * (pheno_data.masked_indivs.transpose().cast<double>() * Geno.square().matrix()); 
+        denum_arr = gsc * gsc * (pheno_data.masked_indivs.transpose().cast<double>() * Geno.square().matrix());
       }
 
       dt_thr->stats = num / denum_arr.sqrt();
@@ -495,14 +654,16 @@ void compute_score_bt(int const& isnp, int const& snp_index, int const& chrom, i
     if(dt_thr->is_sparse) {
       GWs = dt_thr->Gsparse.cwiseProduct(m_ests.Gamma_sqrt_mask.col(i));
       XtWG = XWsqrt.transpose() * GWs;
-    } else {
+    } else if(!dt_thr->cf_ready) {
       GW = (Geno * m_ests.Gamma_sqrt_mask.col(i).array()).matrix();
       dt_thr->Gres = GW - XWsqrt * (XWsqrt.transpose() * GW);
     }
 
     // denominator
-    if(dt_thr->is_sparse) 
+    if(dt_thr->is_sparse)
       dt_thr->denum(i) = GWs.squaredNorm() - XtWG.squaredNorm();
+    else if(dt_thr->cf_ready) // same quantity from block statistics (cf_variant)
+      dt_thr->denum(i) = dt_thr->cf_denum(i);
     else
       dt_thr->denum(i) = dt_thr->Gres.squaredNorm();
 
@@ -515,10 +676,18 @@ void compute_score_bt(int const& isnp, int const& snp_index, int const& chrom, i
     }
 
     // score test stat for BT
-    if(dt_thr->is_sparse) 
+    if(dt_thr->is_sparse)
       dt_thr->stats(i) = GWs.dot(yres.col(i)) / sqrt_denum;
+    else if(dt_thr->cf_ready)
+      dt_thr->stats(i) = dt_thr->cf_num(i) / sqrt_denum;
     else
       dt_thr->stats(i) = dt_thr->Gres.col(0).dot(yres.col(i)) / sqrt_denum;
+
+    // the residualized genotype itself is only needed when firth/spa correction is applied
+    if(dt_thr->cf_ready && block_info->is_corrected(i) && (fabs(dt_thr->stats(i)) > params.z_thr)){
+      GW = (Geno * m_ests.Gamma_sqrt_mask.col(i).array()).matrix();
+      dt_thr->Gres = GW - XWsqrt * (XWsqrt.transpose() * GW);
+    }
 
     if(params.htp_out) {
       dt_thr->scores(i) = dt_thr->stats(i) * sqrt_denum;

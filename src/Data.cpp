@@ -2480,6 +2480,26 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   
   size_t const bs = indices.size();
   ArrayXb err_caught = ArrayXb::Constant(bs, false);
+  bool const parse_here = !params.build_mask && (((params.file_type == "bgen") && params.streamBGEN) || params.file_type == "bed");
+
+  // closed-form score tests: read the whole block first, then get the inner products
+  // needed by the tests of all its variants from one matrix product (see cf_block)
+  cf_block cf;
+  if( cf_supported(params) && (bs > 0) ){
+    if( parse_here ){
+#if defined(_OPENMP)
+      setNbThreads(1);
+#pragma omp parallel for schedule(dynamic)
+#endif
+      for(size_t isnp = 0; isnp < bs; isnp++)
+        parseSNP(isnp, chrom, &(snp_data_blocks[isnp]), insize[isnp], outsize[isnp], &params, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, &snpinfo[indices[isnp]], &Gblock, &(all_snps_info[isnp]), sout);
+#if defined(_OPENMP)
+      setNbThreads(params.threads);
+#endif
+    }
+    cf_prepare(cf, res, in_filters.ind_in_analysis, params, pheno_data, m_ests);
+    cf.S.noalias() = cf.W.transpose() * Gblock.Gmat.leftCols(bs);
+  }
 
     // start openmp for loop
 #if defined(_OPENMP)
@@ -2495,7 +2515,7 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
       #endif
 
       // to store variant information
-      if( !params.build_mask && (((params.file_type == "bgen") && params.streamBGEN) || params.file_type == "bed") )
+      if( parse_here && !cf.active )
         parseSNP(isnp, chrom, &(snp_data_blocks[isnp]), insize[isnp], outsize[isnp], &params, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, &snpinfo[snp_index], &Gblock, block_info, sout);
 
       // to store variant information
@@ -2512,8 +2532,13 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
         get_interaction_terms(isnp, thread_num, &pheno_data, &Gblock, block_info, nullHLM, &params, sout);
       }
 
+      // dense variants: score test quantities in closed form (no residualized copy of G needed)
+      if (cf.active && !block_info->ignored && !Gblock.thread_data[thread_num].is_sparse) {
+        if (params.trait_mode != 0) block_info->scale_fac = 1;
+        cf_variant(cf, isnp, Gblock.Gmat.col(isnp).array(), block_info, &(Gblock.thread_data[thread_num]), params, m_ests);
+      }
       // for QTs with non-sparse G: residualize and re-scale
-      if (!params.skip_cov_res && (params.trait_mode == 0) && !Gblock.thread_data[thread_num].is_sparse)
+      else if (!params.skip_cov_res && (params.trait_mode == 0) && !Gblock.thread_data[thread_num].is_sparse)
         residualize_geno(pheno_data.new_cov, Gblock.Gmat.col(isnp), block_info, params);
       else block_info->scale_fac = 1;
 

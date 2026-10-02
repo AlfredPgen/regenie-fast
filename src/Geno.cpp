@@ -2966,6 +2966,7 @@ void reset_thread(data_thread* snp_data, struct param const& params){
     }
     snp_data->skat_var = params.missing_value_double;
     snp_data->is_sparse = false;
+    snp_data->cf_ready = false;
     snp_data->fastSPA = params.use_SPA && (!params.build_mask || (params.mask_rule_max || params.mask_rule_comphet));
 }
 

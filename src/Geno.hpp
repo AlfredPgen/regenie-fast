@@ -92,6 +92,9 @@ struct data_thread {
   // reset each time
   bool fastSPA = true;
   bool is_sparse = false;
+  // closed-form score test (see cf_block): numerator and variance computed from block statistics
+  bool cf_ready = false;
+  Eigen::ArrayXd cf_num, cf_denum;
 };
 
 struct geno_block {

@@ -47,6 +47,37 @@ struct spa_data {
 
 };
 
+// Closed-form score statistics for dense variants (quantitative and binary traits).
+// The score test of variant g only needs a few inner products of g, so instead of residualizing every
+// genotype vector against the covariates (several passes over all samples per variant), these are computed
+// for a whole block of variants with one matrix product S = W^T G. With an orthonormal covariate basis X and
+// residual r = g - X X^T g (exact identities; c = g - mu e with e in span(X) keeps the sums well conditioned):
+//   yres^T r          = yres^T c - (yres^T X) b,                       b = X^T c
+//   sum_i m_i r_i^2   = sum_i m_i c_i^2 - 2 b^T (X_m^T c) + b^T (X_m^T X_m) b,   X_m = diag(m) X
+// For binary traits the same holds with g, X and yres replaced by Gamma^1/2 g, X_Gamma and the score residuals.
+struct cf_block {
+  bool active = false;
+  int n_pheno = 0, trait_mode = 0;
+  Eigen::MatrixXd W, S; // W: N x K known vectors; S = W^T G (K x block size)
+  // quantitative traits; W = [e | X | X_1 .. X_P | yres]
+  int ncov = 0;
+  bool center = false;
+  double ete = 0;
+  Eigen::VectorXd e, Xte, Yte;
+  Eigen::MatrixXd XtX, YtX, mask_t; // mask_t: P x N trait masks as 0/1
+  std::vector<Eigen::VectorXd> Xpte;
+  std::vector<Eigen::MatrixXd> XptXp;
+  // binary traits, per trait p; W = [gamma_p^2 | X_Gamma_p o gamma_p | gamma_p o yres_p] for each p
+  std::vector<int> col, ncov_p;
+  std::vector<bool> center_p;
+  std::vector<double> g2_sum, gy;
+  std::vector<Eigen::VectorXd> Xwg, Xwy;
+  std::vector<Eigen::MatrixXd> XwtXw;
+};
+bool cf_supported(struct param const&);
+void cf_prepare(cf_block&,const Eigen::Ref<const Eigen::MatrixXd>&,const Eigen::Ref<const ArrayXb>&,struct param const&,struct phenodt const&,struct ests const&);
+void cf_variant(cf_block const&,int const&,const Eigen::Ref<const Eigen::ArrayXd>&,variant_block*,struct data_thread*,struct param const&,struct ests const&);
+
 void blup_read_chr(bool const&,int const&,struct ests&,struct in_files&,struct filter const&,struct phenodt const&,struct param&,mstream&);
 
 // score tests
