@@ -73,6 +73,9 @@ struct ridgel1 {
   Eigen::ArrayXd ridge_param_mult;
   Eigen::MatrixXd beta_snp_step1; // MxR
   std::vector<Eigen::MatrixXd> top_snp_pgs;
+  std::vector<std::pair<int,int>> chr_nblocks; // [chr, #blocks] in the order of the LOCO prediction columns
+  std::vector<Eigen::MatrixXd> pred_kept; // LOCO prediction blocks made at level 1 (--lowmem/--run-l1)
+  Eigen::ArrayXi pred_kept_index; // ridge parameter used for pred_kept (-1 if none)
 };
 
 

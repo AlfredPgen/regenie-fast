@@ -942,6 +942,15 @@ void Data::prep_l1_models(){
   // for chr map
   l1_ests.chrom_map_ndiff = ArrayXi::Zero(params.nChrom);
 
+  // chromosomes in the order of the LOCO prediction columns (see make_predictions)
+  l1_ests.chr_nblocks.clear();
+  if(params.write_l0_pred)
+    for (size_t itr = 0; itr < files.chr_read.size(); ++itr) {
+      int chrom = files.chr_read[itr];
+      if( !in_map(chrom, chr_map) ) continue;
+      l1_ests.chr_nblocks.push_back( std::make_pair(chrom, chr_map[chrom][1]) );
+    }
+
 }
 
 // identify which block to analyze
@@ -1328,19 +1337,23 @@ void Data::make_predictions(int const& ph, int const& val) {
   sout << "  * making predictions..." << flush;
   auto t1 = std::chrono::high_resolution_clock::now();
   int ph_eff = params.write_l0_pred ? 0 : ph;
+  // prediction blocks already made at level 1 for this ridge parameter (no need to read level 0 predictions again)
+  bool use_kept = params.write_l0_pred && !params.within_sample_l0 && !params.test_l0 && (l1_ests.pred_kept_index.size() > ph) && (l1_ests.pred_kept_index(ph) == val);
 
   // read in level 0 predictions from file
-  if(params.write_l0_pred)
-    read_l0(ph, ph_eff, &files, &params, &l1_ests, sout);
-  check_l0(ph, ph_eff, &params, &l1_ests, &pheno_data, sout, true);
+  if(!use_kept){
+    if(params.write_l0_pred)
+      read_l0(ph, ph_eff, &files, &params, &l1_ests, sout);
+    check_l0(ph, ph_eff, &params, &l1_ests, &pheno_data, sout, true);
+  }
 
-  int bs_l1 = l1_ests.test_mat[ph_eff][0].cols();
-  MatrixXd ident_l1 = MatrixXd::Identity(bs_l1,bs_l1);
+  int bs_l1 = use_kept ? l1_ests.beta_hat_level_1[ph][0].rows() : l1_ests.test_mat[ph_eff][0].cols();
   MatrixXd X1, X2, beta_l1, beta_avg;
   string outname;
   ofstream ofile;
 
   if(params.within_sample_l0){ // DEPRECATED
+    MatrixXd ident_l1 = MatrixXd::Identity(bs_l1,bs_l1);
     X1 = l1_ests.test_mat[ph_eff][0].transpose() * l1_ests.test_mat[ph_eff][0];
     X2 = l1_ests.test_mat[ph_eff][0].transpose() * l1_ests.test_pheno[ph][0];
     for(int i = 1; i < params.cv_folds; ++i ) {
@@ -1369,7 +1382,9 @@ void Data::make_predictions(int const& ph, int const& val) {
   int ctr = 0, chr_ctr = 0;
   int nn, cum_size_folds;
 
-  for (size_t itr = 0; itr < files.chr_read.size(); ++itr) {
+  if(use_kept)
+    predictions[0].leftCols(l1_ests.pred_kept[ph].cols()) = l1_ests.pred_kept[ph];
+  else for (size_t itr = 0; itr < files.chr_read.size(); ++itr) {
     int chrom = files.chr_read[itr];
     if( !in_map(chrom, chr_map) ) continue;
 
@@ -1386,6 +1401,8 @@ void Data::make_predictions(int const& ph, int const& val) {
       ctr += nn;
     }
   }
+  // release the kept block (also when it was not used)
+  if(l1_ests.pred_kept.size() > (size_t)ph) l1_ests.pred_kept[ph].resize(0,0);
 
   write_predictions(ph);
 
@@ -1478,19 +1495,22 @@ void Data::make_predictions_binary(int const& ph, int const& val) {
   sout << "  * making predictions..." << flush;
   auto t1 = std::chrono::high_resolution_clock::now();
   int ph_eff = params.write_l0_pred ? 0 : ph;
+  // prediction blocks already made at level 1 for this ridge parameter (no need to read level 0 predictions again)
+  bool use_kept = params.write_l0_pred && !params.within_sample_l0 && !params.test_l0 && (l1_ests.pred_kept_index.size() > ph) && (l1_ests.pred_kept_index(ph) == val);
 
   // read in level 0 predictions from file
-  if(params.write_l0_pred)
-    read_l0(ph, ph_eff, &files, &params, &l1_ests, sout);
-  check_l0(ph, ph_eff, &params, &l1_ests, &pheno_data, sout, true);
+  if(!use_kept){
+    if(params.write_l0_pred)
+      read_l0(ph, ph_eff, &files, &params, &l1_ests, sout);
+    check_l0(ph, ph_eff, &params, &l1_ests, &pheno_data, sout, true);
+  }
 
-  int bs_l1 = l1_ests.test_mat[ph_eff][0].cols();
   ArrayXd etavec, pivec, wvec, zvec, score;
   MatrixXd betaold, betanew, XtW, XtWX, XtWZ;
-  MatrixXd ident_l1 = MatrixXd::Identity(bs_l1,bs_l1);
 
   // fit model using out-of-sample level 0 predictions from whole data
   if(params.within_sample_l0){
+    int bs_l1 = l1_ests.test_mat[ph_eff][0].cols();
     betaold = MatrixXd::Zero(bs_l1, 1);
 
     int niter_cur = 0;
@@ -1531,7 +1551,9 @@ void Data::make_predictions_binary(int const& ph, int const& val) {
   int ctr = 0, chr_ctr = 0;
   int nn, cum_size_folds;
 
-  for (size_t itr = 0; itr < files.chr_read.size(); ++itr) {
+  if(use_kept)
+    predictions[0].leftCols(l1_ests.pred_kept[ph].cols()) = l1_ests.pred_kept[ph];
+  else for (size_t itr = 0; itr < files.chr_read.size(); ++itr) {
     int chrom = files.chr_read[itr];
     if( !in_map(chrom, chr_map) ) continue;
 
@@ -1547,6 +1569,8 @@ void Data::make_predictions_binary(int const& ph, int const& val) {
       ctr += nn;
     }
   }
+  // release the kept block (also when it was not used)
+  if(l1_ests.pred_kept.size() > (size_t)ph) l1_ests.pred_kept[ph].resize(0,0);
 
   write_predictions(ph);
 
@@ -1928,9 +1952,10 @@ void Data::write_predictions(int const& ph){
   Files ofile;
   MatrixXd pred, prs;
 
-  // get header line once
+  // get header line once (and the sample order of the rows)
+  vector<uint32_t> ind_order;
   if(params.write_blups || params.make_loco || params.trait_mode || params.print_prs)
-    header = write_ID_header();
+    header = write_ID_header(&ind_order);
 
   // for the per chromosome predictions (not used)
   if(params.write_blups) {
@@ -1959,8 +1984,7 @@ void Data::write_predictions(int const& ph){
     ofile << header;
 
     // for each row: print chromosome then blups
-    for(int chr = 0; chr < params.nChrom; chr++) 
-      ofile << write_chr_row(chr+1, ph, pred.col(chr));
+    write_chr_rows(ph, pred, ind_order, ofile);
 
     ofile.closeFile();
 
@@ -1993,8 +2017,7 @@ void Data::write_predictions(int const& ph){
     ofile << header;
 
     // print loco predictions for each chromosome
-    for(int chr = 0; chr < params.nChrom; chr++) 
-      ofile << write_chr_row(chr+1, ph, pred.col(chr));
+    write_chr_rows(ph, pred, ind_order, ofile);
 
     ofile.closeFile();
 
@@ -2053,13 +2076,14 @@ void Data::write_predictions(int const& ph){
 
 }
 
-std::string Data::write_ID_header(){
+std::string Data::write_ID_header(vector<uint32_t>* ind_order){
 
   uint32_t index;
   string out, id_index;
   std::ostringstream buffer;
   map<string, uint32_t >::iterator itr_ind;
 
+  if(ind_order) ind_order->clear();
   buffer << "FID_IID ";
   for (itr_ind = params.FID_IID_to_ind.begin(); itr_ind != params.FID_IID_to_ind.end(); ++itr_ind) {
 
@@ -2069,7 +2093,44 @@ std::string Data::write_ID_header(){
 
     id_index = itr_ind->first;
     buffer << id_index << " ";
+    if(ind_order) ind_order->push_back(index);
 
+  }
+
+  buffer << endl;
+  return buffer.str();
+
+}
+
+// rows of all chromosomes: formatted in parallel, written in order
+void Data::write_chr_rows(int const& ph, MatrixXd const& pred, vector<uint32_t> const& ind_order, Files& ofile){
+
+  vector<string> rows(params.nChrom);
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(dynamic)
+#endif
+  for(int chr = 0; chr < params.nChrom; chr++)
+    rows[chr] = write_chr_row(chr+1, ph, pred.col(chr), ind_order);
+
+  for(int chr = 0; chr < params.nChrom; chr++)
+    ofile << rows[chr];
+
+}
+
+// same as below, for samples given in the order of the header
+std::string Data::write_chr_row(int const& chr, int const& ph, const Ref<const VectorXd>& pred, vector<uint32_t> const& ind_order){
+
+  std::ostringstream buffer;
+
+  buffer << chr << " ";
+  for (auto const& index : ind_order) {
+
+    // print prs
+    if( pheno_data.masked_indivs(index, ph) )
+      buffer << pred(index) << " ";
+    else
+      buffer << "NA ";
   }
 
   buffer << endl;

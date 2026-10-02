@@ -99,8 +99,10 @@ class Data {
     void make_predictions_cox(int const&, int const&);
     void print_snp_betas(const Eigen::Ref<const Eigen::VectorXd>&);
     void write_predictions(int const&);
-    std::string write_ID_header();
+    std::string write_ID_header(std::vector<uint32_t>* ind_order = NULL);
     std::string write_chr_row(int const&,int const&,const Eigen::Ref<const Eigen::VectorXd>&);
+    std::string write_chr_row(int const&,int const&,const Eigen::Ref<const Eigen::VectorXd>&,std::vector<uint32_t> const&);
+    void write_chr_rows(int const&,Eigen::MatrixXd const&,std::vector<uint32_t> const&,Files&);
     void rm_l0_files(int const& ph);
 
     // step 2 main functions

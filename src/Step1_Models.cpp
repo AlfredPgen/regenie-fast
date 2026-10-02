@@ -837,20 +837,134 @@ void set_mem_l1(struct in_files* files, struct param* params, struct filter* fil
   }
 }
 
+// fold cross-product X^T X at level 1 (QT); only its lower triangle is read by the solvers
+static void l1_fold_gram(MatrixXd const& X, MatrixXd& XtX){
+#if defined(L1_QT_SYRK)
+  // symmetric rank update (syrk): half the flops of X^T X, but the sums may be ordered
+  // differently from dgemm (enable only once the lower triangles are shown to be bitwise equal)
+  XtX.setZero(X.cols(), X.cols());
+  XtX.selfadjointView<Lower>().rankUpdate(X.transpose());
+#else
+  XtX.noalias() = X.transpose() * X;
+#endif
+}
+
+// work matrices of the level 1 ridge solve of one fold
+struct l1_fold_ws {
+  MatrixXd X1, X2, vmat, dvec, dl_inv, XtX_tau;
+  VectorXd VtX2;
+};
+
+// level 1 ridge solutions of fold i for all ridge parameters
+static void l1_fold_ridge(int const& i, int const& ph, bool const& use_simple_ridge, MatrixXd const& XtX_sum, MatrixXd const& XtY_sum, struct param const* params, struct ridgel1 const* l1, l1_fold_ws& ws, MatrixXd& beta_l1){
+
+  MatrixXd &X1 = ws.X1, &X2 = ws.X2, &vmat = ws.vmat, &dvec = ws.dvec, &dl_inv = ws.dl_inv, &XtX_tau = ws.XtX_tau;
+  VectorXd &VtX2 = ws.VtX2;
+
+  // use either in-sample or out-of-sample predictions
+  if (params->within_sample_l0) { // DEPRECATED
+    X1 = l1->pred_mat[ph][i].transpose() * l1->pred_mat[ph][i];
+    X2 = l1->pred_mat[ph][i].transpose() * l1->pred_pheno[ph][i];
+  } else{
+    // the eigensolver reads the lower triangle only (upper mirrored for completeness)
+    X1.resize(XtX_sum.rows(), XtX_sum.cols());
+    X1.triangularView<Lower>() = XtX_sum - l1->X_folds[i];
+    X1.triangularView<StrictlyUpper>() = X1.transpose();
+    X2 = XtY_sum - l1->XtY[i];
+  }
+
+  if(use_simple_ridge){
+    SelfAdjointEigenSolver<MatrixXd> eigX1(X1);
+    vmat = eigX1.eigenvectors();
+    dvec = eigX1.eigenvalues();
+    VtX2 = vmat.transpose() * X2;
+    // compute solutions for all ridge parameters at once
+    dl_inv = ( dvec.rowwise().replicate(params->n_ridge_l1) + l1->ridge_param_mult.matrix() * params->tau[ph].matrix().transpose() ).array().inverse().matrix();
+    dl_inv.array().colwise() *= VtX2.array();
+    beta_l1 = vmat * dl_inv;
+  } else { // need to compute seperately for each parameter
+    beta_l1.resize(X1.rows(), params->n_ridge_l1);
+    for(int j = 0; j < params->n_ridge_l1; ++j) {
+      XtX_tau = X1;
+      XtX_tau.diagonal().array() += params->tau[ph](j) * l1->ridge_param_mult;
+      SelfAdjointEigenSolver<MatrixXd> eigMat(XtX_tau);
+      beta_l1.col(j) = eigMat.eigenvectors() * (1/eigMat.eigenvalues().array()).matrix().asDiagonal() * eigMat.eigenvectors().transpose() * X2;
+    }
+  }
+
+}
+
+// --lowmem/--run-l1: make the LOCO prediction blocks of a trait (the products of Data::make_predictions
+// for the ridge parameter Data::output will select) while its level 0 predictions are loaded, so they
+// need not be read from disk again; they are used only if output() selects the same ridge parameter
+static void keep_l1_predictions(int const& ph, int const& ph_eff, struct param const* params, struct phenodt const* pheno_data, struct ridgel1* l1){
+
+  int ncols = 0, nn;
+  for(auto const& cb : l1->chr_nblocks)
+    if( (cb.second * params->n_ridge_l0 - l1->chrom_map_ndiff(cb.first - 1)) > 0 ) ncols++;
+  // memory kept is at most that of one trait's level 0 predictions, and at most 256MB
+  int n_kept = (l1->pred_kept_index >= 0).count() + 1;
+  if( (n_kept * ncols > params->total_n_block * params->n_ridge_l0) ||
+      ((double) n_kept * ncols * params->n_samples * sizeof(double) > 256e6) ) return;
+
+  // optimal parameter by cv (QT: MSE, BT: -loglik)
+  int val = 0;
+  double performance_measure, min_val = 1e10;
+  for(int j = 0; j < params->n_ridge_l1; ++j ) {
+    if(params->trait_mode == 0)
+      performance_measure = l1->cumsum_values[2](ph, j) + l1->cumsum_values[3](ph,j) - 2 * l1->cumsum_values[4](ph,j);
+    else
+      performance_measure = l1->cumsum_values[5](ph, j);
+    performance_measure /= pheno_data->Neff(ph);
+    if( performance_measure < min_val) {
+      val = j;
+      min_val = performance_measure;
+    }
+  }
+
+  MatrixXd beta_l1;
+  MatrixXd& pred = l1->pred_kept[ph];
+  pred.resize(params->n_samples, ncols);
+  int ctr = 0, chr_ctr = 0, cum_size_folds;
+
+  for(auto const& cb : l1->chr_nblocks){
+    nn = cb.second * params->n_ridge_l0 - l1->chrom_map_ndiff(cb.first - 1);
+    if(nn > 0) {
+      cum_size_folds = 0;
+      for(int i = 0; i < params->cv_folds; ++i ) {
+        beta_l1 = l1->beta_hat_level_1[ph][i].col(val);
+        pred.block(cum_size_folds, chr_ctr, params->cv_sizes(i), 1) = l1->test_mat[ph_eff][i].block(0, ctr, params->cv_sizes(i), nn) * beta_l1.block(ctr, 0, nn, 1);
+        cum_size_folds += params->cv_sizes(i);
+      }
+      chr_ctr++;
+      ctr += nn;
+    }
+  }
+
+  l1->pred_kept_index(ph) = val;
+}
+
 void ridge_level_1(struct in_files* files, struct param* params, struct phenodt* pheno_data, struct ridgel1* l1, mstream& sout) {
 
   sout << endl << " Level 1 ridge..." << endl << flush;
 
   string in_pheno;
   ifstream infile;
-  MatrixXd X1, X2, beta_l1, p1, vmat, dvec, dl_inv, XtX_tau;
-  VectorXd VtX2;
+  MatrixXd beta_l1, p1;
   MatrixXd XtX_sum, XtY_sum;
+  l1_fold_ws ws;
+  vector<MatrixXd> beta_folds;
 
   // to compute Rsq and MSE of predictions
   for (int i = 0; i < 5; i++){
     l1->cumsum_values[i].setZero(params->n_pheno, params->n_ridge_l1);
     if(params->test_l0) l1->cumsum_values_full[i].setZero(params->n_pheno, params->n_ridge_l1);
+  }
+  l1->pred_kept.clear();
+  l1->pred_kept_index.resize(0);
+  if(params->write_l0_pred){
+    l1->pred_kept.assign(params->n_pheno, MatrixXd());
+    l1->pred_kept_index = ArrayXi::Constant(params->n_pheno, -1);
   }
 
   for(int ph = 0; ph < params->n_pheno; ++ph ) {
@@ -869,47 +983,42 @@ void ridge_level_1(struct in_files* files, struct param* params, struct phenodt*
     bool use_simple_ridge = (l1->ridge_param_mult == 1).all();
 
     // compute XtX and Xty for each fold and cum. sum using test_mat's
+    // (lower triangles only: the solvers read nothing else)
     if (!params->within_sample_l0){
       XtX_sum.setZero(bs_l1, bs_l1);
       XtY_sum.setZero(bs_l1, 1);
       for( int i = 0; i < params->cv_folds; ++i ) {
-        l1->X_folds[i] = l1->test_mat[ph_eff][i].transpose() * l1->test_mat[ph_eff][i];
+        l1_fold_gram(l1->test_mat[ph_eff][i], l1->X_folds[i]);
         l1->XtY[i]     = l1->test_mat[ph_eff][i].transpose() * l1->test_pheno[ph][i];
-        XtX_sum += l1->X_folds[i];
+        XtX_sum.triangularView<Lower>() += l1->X_folds[i];
         XtY_sum += l1->XtY[i];
       }
     }
 
+    bool par_folds = false;
+#if defined(WITH_MKL) && defined(L1_QT_PAR_FOLDS)
+    // opt-in: the eigendecompositions scale poorly with threads, so run the folds concurrently,
+    // each with sequential MKL (results then match --threads 1, not necessarily --threads T)
+    par_folds = !params->within_sample_l0 && (params->threads > 1) && (params->cv_folds > 1);
+    if(par_folds){
+      beta_folds.resize(params->cv_folds);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(dynamic) num_threads(std::min(params->threads, params->cv_folds))
+#endif
+      for(int i = 0; i < params->cv_folds; ++i ) {
+        l1_fold_ws ws_i;
+        int mkl_nt = mkl_set_num_threads_local(1);
+        l1_fold_ridge(i, ph, use_simple_ridge, XtX_sum, XtY_sum, params, l1, ws_i, beta_folds[i]);
+        mkl_set_num_threads_local(mkl_nt);
+      }
+    }
+#endif
+
     uint32_t cum_size_folds = 0;
     for(int i = 0; i < params->cv_folds; ++i ) {
 
-      // use either in-sample or out-of-sample predictions
-      if (params->within_sample_l0) { // DEPRECATED
-        X1 = l1->pred_mat[ph][i].transpose() * l1->pred_mat[ph][i];
-        X2 = l1->pred_mat[ph][i].transpose() * l1->pred_pheno[ph][i];
-      } else{
-        X1 = XtX_sum - l1->X_folds[i];
-        X2 = XtY_sum - l1->XtY[i];
-      }
-
-      if(use_simple_ridge){
-        SelfAdjointEigenSolver<MatrixXd> eigX1(X1);
-        vmat = eigX1.eigenvectors();
-        dvec = eigX1.eigenvalues();
-        VtX2 = vmat.transpose() * X2;
-      // compute solutions for all ridge parameters at once
-        dl_inv = ( dvec.rowwise().replicate(params->n_ridge_l1) + l1->ridge_param_mult.matrix() * params->tau[ph].matrix().transpose() ).array().inverse().matrix();
-        dl_inv.array().colwise() *= VtX2.array();
-        beta_l1 = vmat * dl_inv;
-      } else { // need to compute seperately for each parameter
-        beta_l1.resize(bs_l1, params->n_ridge_l1);
-        for(int j = 0; j < params->n_ridge_l1; ++j) {
-          XtX_tau = X1;
-          XtX_tau.diagonal().array() += params->tau[ph](j) * l1->ridge_param_mult;
-          SelfAdjointEigenSolver<MatrixXd> eigMat(XtX_tau);
-          beta_l1.col(j) = eigMat.eigenvectors() * (1/eigMat.eigenvalues().array()).matrix().asDiagonal() * eigMat.eigenvectors().transpose() * X2;
-        }
-      }
+      if(par_folds) beta_l1 = beta_folds[i];
+      else l1_fold_ridge(i, ph, use_simple_ridge, XtX_sum, XtY_sum, params, l1, ws, beta_l1);
       if(!params->within_sample_l0) l1->beta_hat_level_1[ph][i] = beta_l1;
       // p1 is Nfold x nridge_l1 matrix
       p1 = l1->test_mat[ph_eff][i] * beta_l1;
@@ -929,6 +1038,10 @@ void ridge_level_1(struct in_files* files, struct param* params, struct phenodt*
 
       cum_size_folds += params->cv_sizes(i);
     }
+
+    // LOCO prediction blocks made now, while this trait's level 0 predictions are in memory
+    if(params->write_l0_pred && !params->within_sample_l0 && !params->test_l0)
+      keep_l1_predictions(ph, ph_eff, params, pheno_data, l1);
 
     sout << "done";
     auto ts2 = std::chrono::high_resolution_clock::now();
@@ -1030,6 +1143,51 @@ void ridge_level_1_loocv(struct in_files* files, struct param* params, struct ph
 }
 
 
+// first X.rows() columns of XtW = X^T diag(w): each entry is the single product X(r,a) * w(r), as in
+// X.transpose() * w.asDiagonal(), written tile by tile in parallel instead of by a strided serial copy
+static void transpose_scale(MatrixXd const& X, ArrayXd const& w, MatrixXd& XtW){
+
+  const Index n = X.rows(), p = X.cols(), ldx = X.outerStride(), ldo = XtW.outerStride(), nb = 64;
+  const double* x = X.data();
+  const double* wv = w.data();
+  double* o = XtW.data();
+  eigen_assert( (XtW.rows() == p) && (XtW.cols() >= n) && (w.size() == n) );
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+  for(Index r0 = 0; r0 < n; r0 += nb)
+    for(Index a0 = 0; a0 < p; a0 += nb)
+      for(Index r = r0; r < std::min(r0 + nb, n); r++) {
+        const double wr = wv[r];
+        for(Index a = a0; a < std::min(a0 + nb, p); a++)
+          o[r * ldo + a] = x[a * ldx + r] * wr;
+      }
+}
+
+// training fold product G = XtW * X at level 1 (BT); only its lower triangle is read
+static void l1_fold_xtwx(const Ref<const MatrixXd>& XtW, MatrixXd const& X, MatrixXd& G){
+#if defined(WITH_MKL) && defined(L1_BT_GEMMT)
+  // lower triangle only (half the flops of the full product), but dgemmt may order the sums
+  // differently from dgemm (enable only once the lower triangles are shown to be bitwise equal)
+  G.resize(XtW.rows(), XtW.rows());
+  cblas_dgemmt(CblasColMajor, CblasLower, CblasNoTrans, CblasNoTrans, G.rows(), X.rows(), 1.0, XtW.data(), XtW.outerStride(), X.data(), X.outerStride(), 0.0, G.data(), G.outerStride());
+#else
+  G.noalias() = XtW * X;
+#endif
+}
+
+// eta and p of training fold k at beta: the step-halving check, the score and the next iteration
+// evaluate the same beta, so the values computed last for fold k are reused when beta is unchanged
+static void fold_pvec(int const& k, ArrayXd const& beta, const Ref<const ArrayXd>& offset, const Ref<const MatrixXd>& X, double const& eps, vector<ArrayXd>& eta_k, vector<ArrayXd>& pi_k, vector<ArrayXd>& beta_k){
+
+  if( (beta_k[k].size() == beta.size()) && (memcmp(beta_k[k].data(), beta.data(), beta.size() * sizeof(double)) == 0) )
+    return;
+
+  get_pvec(eta_k[k], pi_k[k], beta, offset, X, eps);
+  beta_k[k] = beta;
+}
+
 // Logistic models
 void ridge_logistic_level_1(struct in_files* files, struct param* params, struct phenodt* pheno_data, struct ridgel1* l1, vector<MatrixXb>& masked_in_folds, mstream& sout) {
 
@@ -1041,9 +1199,22 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
   ifstream infile;
 
   ArrayXd Y1, W1, p1, score;
-  ArrayXd betaold, etavec, pivec, wvec, zvec, betanew, etatest;
-  MatrixXd X1, XtW, XtWX, XtWZ;
+  ArrayXd betaold, etavec, pivec, wvec, zvec, betanew, etatest, wsel;
+  MatrixXd X1, XtW, XtWX, XtWZ, Gk;
+  VectorXd XtWZ_k;
+  // k-fold: eta/p cached per training fold, and the training fold products at the
+  // starting value beta=0 (the same for every held-out fold)
+  vector<ArrayXd> eta_k(params->cv_folds), pi_k(params->cv_folds), beta_k(params->cv_folds);
+  vector<MatrixXd> G0_k;
+  vector<VectorXd> XtWZ0_k;
+  ArrayXb start_done;
   l1->pheno_l1_not_converged = ArrayXb::Constant(params->n_pheno, false);
+  l1->pred_kept.clear();
+  l1->pred_kept_index.resize(0);
+  if(params->write_l0_pred){
+    l1->pred_kept.assign(params->n_pheno, MatrixXd());
+    l1->pred_kept_index = ArrayXi::Constant(params->n_pheno, -1);
+  }
 
   for (int i = 0; i < 6; i++)
     l1->cumsum_values[i].setZero(params->n_pheno, params->n_ridge_l1);
@@ -1060,7 +1231,20 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
       read_l0(ph, ph_eff, files, params, l1, sout);
     check_l0(ph, ph_eff, params, l1, pheno_data, sout);
     bs_l1 = l1->test_mat[ph_eff][0].cols();
-    MatrixXd ident_l1 = MatrixXd::Identity(bs_l1,bs_l1);
+
+    bool share_start = false;
+    if( !params->within_sample_l0 ){
+      // one XtW buffer for all folds
+      int n_max = params->cv_sizes.maxCoeff();
+      if( (XtW.rows() != bs_l1) || (XtW.cols() != n_max) ) XtW.resize(bs_l1, n_max);
+      for(int k = 0; k < params->cv_folds; ++k ) beta_k[k].resize(0);
+      // keep the beta=0 fold products if they take no more memory than the XtW buffer (or 256MB)
+      double start_bytes = (double) params->cv_folds * bs_l1 * bs_l1 * sizeof(double);
+      share_start = (params->cv_folds > 2) && ( (start_bytes <= (double) bs_l1 * n_max * sizeof(double)) || (start_bytes <= 256e6) );
+      G0_k.assign(share_start ? params->cv_folds : 0, MatrixXd());
+      XtWZ0_k.assign(share_start ? params->cv_folds : 0, VectorXd());
+      start_done = ArrayXb::Constant(params->cv_folds, false);
+    }
 
     for(int i = 0; i < params->cv_folds; ++i ) {
       if( l1->pheno_l1_not_converged(ph) ) break;
@@ -1108,28 +1292,45 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
 
             XtWX = params->tau[ph](j) * l1->ridge_param_mult.matrix().asDiagonal();
             XtWZ = MatrixXd::Zero(bs_l1, 1);
+            // first iteration of the first ridge parameter: beta=0 for every held-out fold
+            bool at_start = share_start && (j == 0) && (niter_cur == 1);
 
             for(int k = 0; k < params->cv_folds; ++k ) {
               if( k != i) {
 
-                // get w=p*(1-p) and check none of the values are 0
-                get_pvec(etavec, pivec, betaold, l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k], params->numtol_eps);
-                if( get_wvec(pivec, wvec, masked_in_folds[k].col(ph).array(), params->l1_ridge_eps) ){
-                  sout << "ERROR: Zeros occurred in Var(Y) during ridge logistic regression! (Try with --loocv)" << endl;
-                  l1->pheno_l1_not_converged(ph) = true;
-                  break;
+                if( !at_start || !start_done(k) ) {
+
+                  // get w=p*(1-p) and check none of the values are 0
+                  fold_pvec(k, betaold, l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k], params->numtol_eps, eta_k, pi_k, beta_k);
+                  if( get_wvec(pi_k[k], wvec, masked_in_folds[k].col(ph).array(), params->l1_ridge_eps) ){
+                    sout << "ERROR: Zeros occurred in Var(Y) during ridge logistic regression! (Try with --loocv)" << endl;
+                    l1->pheno_l1_not_converged(ph) = true;
+                    break;
+                  }
+
+                  zvec = masked_in_folds[k].col(ph).array().select((eta_k[k] - l1->test_offset[ph][k].array()) + (l1->test_pheno_raw[ph][k].array() - pi_k[k]) / wvec, 0);
+
+                  // XtW = X_k^T diag(w) with w=0 for masked samples
+                  wsel = masked_in_folds[k].col(ph).array().select(wvec,0);
+                  transpose_scale(l1->test_mat[ph_eff][k], wsel, XtW);
+                  l1_fold_xtwx(XtW.leftCols(params->cv_sizes(k)), l1->test_mat[ph_eff][k], at_start ? G0_k[k] : Gk);
+                  (at_start ? XtWZ0_k[k] : XtWZ_k).noalias() = XtW.leftCols(params->cv_sizes(k)) * zvec.matrix();
+                  if(at_start) start_done(k) = true;
                 }
 
-                zvec = masked_in_folds[k].col(ph).array().select((etavec - l1->test_offset[ph][k].array()) + (l1->test_pheno_raw[ph][k].array() - pivec) / wvec, 0);
-
-                XtW = l1->test_mat[ph_eff][k].transpose() * masked_in_folds[k].col(ph).array().select(wvec,0).matrix().asDiagonal();
-                XtWX += XtW * l1->test_mat[ph_eff][k];
-                XtWZ += XtW * zvec.matrix();
+                // only the lower triangle is used by the Cholesky factorization
+                XtWX.triangularView<Lower>() += (at_start ? G0_k[k] : Gk);
+                XtWZ += (at_start ? XtWZ0_k[k] : XtWZ_k);
               }
             }
             if( l1->pheno_l1_not_converged(ph) ) break;
 
-            betanew = XtWX.llt().solve(XtWZ).array();
+            // Cholesky factorization in place (XtWX is rebuilt at every iteration), same
+            // potrf and triangular solves as XtWX.llt().solve(XtWZ)
+            Eigen::internal::llt_inplace<double, Eigen::Lower>::blocked(XtWX);
+            XtWX.triangularView<Lower>().solveInPlace(XtWZ);
+            XtWX.triangularView<Lower>().adjoint().solveInPlace(XtWZ);
+            betanew = XtWZ.array();
 
             // start step-halving
             for( int niter_search = 1; niter_search <= params->niter_max_line_search_ridge; niter_search++ ){
@@ -1139,8 +1340,8 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
               for(int k = 0; k < params->cv_folds; ++k ) {
                 if( k != i) {
                   // get w=p*(1-p) and check none of the values are 0
-                  get_pvec(etavec, pivec, betanew, l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k], params->numtol_eps);
-                  invalid_wvec = get_wvec(pivec, wvec, masked_in_folds[k].col(ph).array(), params->l1_ridge_eps);
+                  fold_pvec(k, betanew, l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k], params->numtol_eps, eta_k, pi_k, beta_k);
+                  invalid_wvec = get_wvec(pi_k[k], wvec, masked_in_folds[k].col(ph).array(), params->l1_ridge_eps);
                   if( invalid_wvec ) break; // do another halving
                 }
               }
@@ -1157,13 +1358,13 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
             for(int k = 0; k < params->cv_folds; ++k ) {
               if( k != i) {
                 // get w=p*(1-p) and check none of the values are 0
-                get_pvec(etavec, pivec, betanew, l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k], params->numtol_eps);
-                if( get_wvec(pivec, wvec, masked_in_folds[k].col(ph).array(), params->l1_ridge_eps) ){
+                fold_pvec(k, betanew, l1->test_offset[ph][k].array(), l1->test_mat[ph_eff][k], params->numtol_eps, eta_k, pi_k, beta_k);
+                if( get_wvec(pi_k[k], wvec, masked_in_folds[k].col(ph).array(), params->l1_ridge_eps) ){
                   sout << "ERROR: Zeros occurred in Var(Y) during ridge logistic regression! (Try with --loocv)" << endl;
                   l1->pheno_l1_not_converged(ph) = true;
                   break;
                 }
-                score += (l1->test_mat[ph_eff][k].transpose() * masked_in_folds[k].col(ph).array().select(l1->test_pheno_raw[ph][k].array() - pivec, 0).matrix()).array();
+                score += (l1->test_mat[ph_eff][k].transpose() * masked_in_folds[k].col(ph).array().select(l1->test_pheno_raw[ph][k].array() - pi_k[k], 0).matrix()).array();
               }
             }
             score -= params->tau[ph](j) * l1->ridge_param_mult * betanew;
@@ -1212,6 +1413,11 @@ void ridge_logistic_level_1(struct in_files* files, struct param* params, struct
 
       }
     }
+    G0_k.clear(); XtWZ0_k.clear();
+
+    // LOCO prediction blocks made now, while this trait's level 0 predictions are in memory
+    if(params->write_l0_pred && !params->within_sample_l0 && !params->test_l0 && !l1->pheno_l1_not_converged(ph))
+      keep_l1_predictions(ph, ph_eff, params, pheno_data, l1);
 
     sout << "done";
     auto ts2 = std::chrono::high_resolution_clock::now();
@@ -2041,10 +2247,14 @@ void read_l0_chunk(int const& ph, int const& ph_eff, int const& start, int const
 
     int nt = 0;
 
+    // the file is column-major with the folds in order: column m of fold i is one contiguous run
     for( int m = start; nt < np; nt++, m++ )
       for( int i = 0; i < params->cv_folds; ++i )
-        for( int k = 0; k < params->cv_sizes(i); ++k )
-          infile.read( reinterpret_cast<char *> (&l1->test_mat[ph_eff][i](k,m)), sizeof(double) );
+        if( params->cv_sizes(i) > 0 )
+          infile.read( reinterpret_cast<char *> (&l1->test_mat[ph_eff][i](0,m)), params->cv_sizes(i) * sizeof(double) );
+
+    if( infile.fail() )
+      throw "cannot read level 0 predictions from file " + in_pheno;
 
   //if(start==0) cerr << endl <<l1->test_mat[ph_eff][0].block(0,0,3,3) << endl;
 
