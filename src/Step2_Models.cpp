@@ -40,6 +40,7 @@
 #include "Masks.hpp"
 #include "Data.hpp"
 #include "MCC.hpp"
+#include "bgen8_parse.hpp"
 
 using namespace std;
 using namespace Eigen;
@@ -263,20 +264,39 @@ void cf_prepare(cf_block& cf, const Ref<const MatrixXd>& yres, const Ref<const A
     }
     if(!cf.center) cf.e = VectorXd::Zero(N);
     cf.ete = cf.center ? cf.e.squaredNorm() : 1;
+    cf.e_ind = cf.e.array() != 0;
 
-    MatrixXd mask_d = pheno_data.masked_indivs.cast<double>();
-    cf.mask_t = mask_d.transpose();
-    cf.W.resize(N, 1 + C + C * P + P);
+    // when e and X are 0 outside the analysis, a trait masked as the analysis has X_p = X and the same sums of
+    // squares as all samples: only the other traits (none in strict mode) need their own X_p block in W and their
+    // own masked sum in cf_variant. This, like ss and rr in cf_variant, relies on every reader setting the tested
+    // genotypes to 0 outside the analysis (mean_impute_g, or bgen8_parse_fast with zero_out)
+    bool out_zero = true;
+    for(Index i = 0; (i < N) && out_zero; i++)
+      if(!ind_in_analysis(i)) out_zero = (cf.e(i) == 0) && (X.row(i).array() == 0).all();
+    vector<int> own;
+    cf.q_col.assign(P, -1);
+    for(int p = 0; p < P; p++)
+      if(!out_zero || (pheno_data.masked_indivs.col(p).array() != ind_in_analysis).any()){
+        cf.q_col[p] = own.size();
+        own.push_back(p);
+      }
+    int const Q = own.size();
+
+    cf.W.resize(N, 1 + C + C * Q + P);
     cf.W.col(0) = cf.e;
     cf.W.middleCols(1, C) = X;
-    cf.Xpte.resize(P);
-    cf.XptXp.resize(P);
-    for(int p = 0; p < P; p++){
-      auto Xp = cf.W.middleCols(1 + C + p * C, C);
-      Xp = mask_d.col(p).asDiagonal() * X;
-      cf.Xpte[p] = Xp.transpose() * cf.e;
-      cf.XptXp[p] = Xp.transpose() * Xp;
+    cf.q_mask.resize(N, Q);
+    cf.Xpte.resize(Q);
+    cf.XptXp.resize(Q);
+    for(int k = 0; k < Q; k++){
+      VectorXd const mp = pheno_data.masked_indivs.col(own[k]).cast<double>();
+      auto Xp = cf.W.middleCols(1 + C + k * C, C);
+      Xp = mp.asDiagonal() * X;
+      cf.q_mask.col(k) = pheno_data.masked_indivs.col(own[k]);
+      cf.Xpte[k] = Xp.transpose() * cf.e;
+      cf.XptXp[k] = Xp.transpose() * Xp;
     }
+    cf.y_row = 1 + C + C * Q;
     cf.W.rightCols(P) = yres;
     cf.Xte = X.transpose() * cf.e;
     cf.XtX = X.transpose() * X;
@@ -295,8 +315,10 @@ void cf_prepare(cf_block& cf, const Ref<const MatrixXd>& yres, const Ref<const A
     cf.XwtXw.resize(P);
 
     int K = 0;
+    cf.traits.clear();
     for(int p = 0; p < P; p++){
       if(!params.pheno_pass(p)) continue;
+      cf.traits.push_back(p);
       cf.col[p] = K;
       cf.ncov_p[p] = m_ests.X_Gamma[p].cols();
       K += cf.ncov_p[p] + 2;
@@ -336,19 +358,14 @@ void cf_variant(cf_block const& cf, int const& isnp, const Ref<const ArrayXd>& G
 
   if(cf.trait_mode == 0){
 
-    int const C = cf.ncov;
+    int const C = cf.ncov, Q = cf.q_mask.cols();
     double const mu = cf.center ? s(0) / cf.ete : 0;
     VectorXd const b = s.segment(1, C) - mu * cf.Xte; // X^T c
 
-    // sum of squares of c = g - mu e, over all samples and within each trait mask
+    // sum of squares of c = g - mu e, over all samples and within the masks of q_mask (in sample order)
     double ss = 0;
-    ArrayXd q = ArrayXd::Zero(P);
-    for(Index i = 0; i < N; i++){
-      double const ci = Geno(i) - mu * cf.e(i);
-      double const c2 = ci * ci;
-      ss += c2;
-      for(int p = 0; p < P; p++) q(p) += cf.mask_t(p, i) * c2;
-    }
+    ArrayXd q(Q);
+    cf_sumsq_qt(Geno.data(), cf.e_ind.data(), mu, N, cf.q_mask.data(), cf.q_mask.rows(), Q, ss, q.data());
 
     // scale of the residualized genotype (as in residualize_geno)
     double const rr = ss - 2 * b.squaredNorm() + b.dot(cf.XtX * b);
@@ -359,28 +376,32 @@ void cf_variant(cf_block const& cf, int const& isnp, const Ref<const ArrayXd>& G
     }
 
     for(int p = 0; p < P; p++){
-      VectorXd const Xpc = s.segment(1 + C + p * C, C) - mu * cf.Xpte[p];
-      dt_thr->cf_num(p) = (s(1 + C + C * P + p) - mu * cf.Yte(p)) - cf.YtX.row(p).dot(b);
-      dt_thr->cf_denum(p) = q(p) - 2 * b.dot(Xpc) + b.dot(cf.XptXp[p] * b);
+      dt_thr->cf_num(p) = (s(cf.y_row + p) - mu * cf.Yte(p)) - cf.YtX.row(p).dot(b);
+      int const k = cf.q_col[p];
+      if(k < 0) { // X_p = X: same as over all samples
+        dt_thr->cf_denum(p) = rr;
+        continue;
+      }
+      VectorXd const Xpc = s.segment(1 + C + k * C, C) - mu * cf.Xpte[k];
+      dt_thr->cf_denum(p) = q(k) - 2 * b.dot(Xpc) + b.dot(cf.XptXp[k] * b);
     }
 
   } else {
 
-    for(int p = 0; p < P; p++){
-      if(cf.col[p] < 0) continue;
-      int const o = cf.col[p], Cp = cf.ncov_p[p];
-      MapcArXd gam (m_ests.Gamma_sqrt_mask.col(p).data(), N);
-      double const mu = cf.center_p[p] ? s(o) / cf.g2_sum[p] : 0;
-      VectorXd const b = s.segment(o + 1, Cp) - mu * cf.Xwg[p]; // X_Gamma^T Gamma^1/2 c
+    // all traits in one pass over the samples (in sample order for each trait)
+    int const nq = cf.traits.size();
+    ArrayXd mu(nq), q(nq);
+    for(int k = 0; k < nq; k++){
+      int const p = cf.traits[k];
+      mu(k) = cf.center_p[p] ? s(cf.col[p]) / cf.g2_sum[p] : 0;
+    }
+    cf_sumsq_bt(Geno.data(), N, m_ests.Gamma_sqrt_mask.data(), m_ests.Gamma_sqrt_mask.rows(), cf.traits.data(), mu.data(), nq, q.data());
 
-      double q = 0;
-      for(Index i = 0; i < N; i++){
-        double const d = gam(i) * (Geno(i) - mu);
-        q += d * d;
-      }
-
-      dt_thr->cf_denum(p) = q - 2 * b.squaredNorm() + b.dot(cf.XwtXw[p] * b);
-      dt_thr->cf_num(p) = (s(o + 1 + Cp) - mu * cf.gy[p]) - b.dot(cf.Xwy[p]);
+    for(int k = 0; k < nq; k++){
+      int const p = cf.traits[k], o = cf.col[p], Cp = cf.ncov_p[p];
+      VectorXd const b = s.segment(o + 1, Cp) - mu(k) * cf.Xwg[p]; // X_Gamma^T Gamma^1/2 c
+      dt_thr->cf_denum(p) = q(k) - 2 * b.squaredNorm() + b.dot(cf.XwtXw[p] * b);
+      dt_thr->cf_num(p) = (s(o + 1 + Cp) - mu(k) * cf.gy[p]) - b.dot(cf.Xwy[p]);
     }
 
   }

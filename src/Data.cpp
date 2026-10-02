@@ -2937,9 +2937,9 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
       // to store variant information
       reset_thread(&(Gblock.thread_data[thread_num]), params);
 
-      // check if g is sparse
-      if (!params.w_interaction)
-        check_sparse_G(isnp, thread_num, &Gblock, params.n_samples, in_filters.ind_in_analysis, block_info->n_zero, params.prop_zero_thr);
+      // check if g is sparse (not needed for variants that failed the filters)
+      if (!params.w_interaction && !block_info->ignored)
+        check_sparse_G(isnp, thread_num, &Gblock, params.n_samples, in_filters.ind_in_analysis, block_info->n_zero, params.prop_zero_thr, block_info->nnz);
 
       if (params.w_interaction)
       {

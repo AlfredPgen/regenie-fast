@@ -109,6 +109,7 @@ struct geno_block {
 struct variant_block {
   bool ignored, flipped;
   int n_rr, n_aa, n_zero = -1;
+  int nnz = -1; // non-zero entries among the analyzed samples, when known from parsing (-1 otherwise)
   double scale_fac, mac1, af1, info1, ns1, ns1_adj;
   Eigen::ArrayXi ns, ns_case, ns_control, nmales, ns_case_adj;
   Eigen::ArrayXd af, af_case, af_control, mac, info, cf_burden;
@@ -207,7 +208,7 @@ void update_af_cc(int const&,double const&,variant_block*,const Eigen::Ref<const
 void compute_mac(bool const&,double&,double const&,int const&,int const&,bool const&,bool const&,variant_block*,struct param const*);
 void compute_aaf_info(double&,double const&,bool const&,variant_block*,struct param const*);
 void flip_geno(double&,Eigen::Ref<Eigen::ArrayXd>,variant_block*,struct param const*);
-void check_sparse_G(int const&,int const&,struct geno_block*,uint32_t const&,const Eigen::Ref<const ArrayXb>&,int const&,const double&);
+void check_sparse_G(int const&,int const&,struct geno_block*,uint32_t const&,const Eigen::Ref<const ArrayXb>&,int const&,const double&,int const& nnz = -1);
 void mean_impute_g(double &,const double&,const bool&);
 void mean_impute_g(const double&,Eigen::Ref<Eigen::ArrayXd>,const Eigen::Ref<const ArrayXb>&);
 void residualize_geno(int const&,int const&,variant_block*,bool const&,const Eigen::Ref<const Eigen::MatrixXd>&,struct geno_block*,struct param const*);

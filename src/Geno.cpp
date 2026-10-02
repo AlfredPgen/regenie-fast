@@ -2345,6 +2345,20 @@ void parseSNP(const int& isnp, const int &chrom, vector<uchar>* geno_block, cons
 
 }
 
+// as flip_geno, for a column whose samples outside the analysis are already 0 (they stay 0)
+static void flip_geno_analyzed(double& total, Ref<ArrayXd> Geno, const Ref<const ArrayXb>& in_analysis, variant_block* snp_data, struct param const* params){
+
+  if(!params->with_flip) return;
+
+  // switch to minor allele
+  snp_data->flipped = (total > 1);
+
+  if(snp_data->flipped){
+    Geno = ( in_analysis && (Geno != -3.0) ).select(2 - Geno, Geno);
+    total = 2 - total;
+  }
+
+}
 
 void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_block, const uint32_t& insize, const uint32_t& outsize, struct param const* params, struct filter const* filters, const Ref<const MatrixXb>& masked_indivs, const Ref<const MatrixXd>& phenotypes_raw, const snp* infosnp, struct geno_block* gblock, variant_block* snp_data, mstream& sout){
 
@@ -2420,24 +2434,35 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
   // get dosages (can compute mean as going along (and identify non-zero entries if SPA is used)
   bool missing;
   int lval, ncarriers = 0, nmales = 0;
-  uint32_t n_missing = 0, n_out = 0;
+  uint32_t n_missing = 0, n_out = 0, ns1 = 0, n_zero = 0, n_two = 0;
   double prob0, prob1, prob2, total = 0, mac = 0, mval, ival, info_num = 0, sum_pos;
 
   // parse genotype probabilities block
   index = 0;
+  // fast path: samples not in the analysis are set to 0 when parsing, so only the missing analyzed samples
+  // (n_missing) are left to impute; not when their values are read before imputation (genotype counts of
+  // --htp, LD matrix and interaction terms of variants that fail the filters)
+  bool const zero_out = fast_parse && !params->htp_out && !params->getCorMat && !params->w_interaction;
   if( fast_parse ){
     // same per-sample arithmetic and summation order as the loop below (see bgen8_parse.cpp)
-    struct trait_ctx { variant_block* snp_data; const Ref<const MatrixXb>* mask; } ctx = { snp_data, &masked_indivs };
-    bgen8_trait_counts_fn trait_counts = [](void* c, int ind, double gval, double ivalue) {
-      trait_ctx* t = static_cast<trait_ctx*>(c);
-      update_trait_counts(ind, gval, gval, 0, ivalue, t->snp_data, *(t->mask));
-    };
     bgen8_parse_sums sums;
-    bgen8_parse_fast(buffer, ploidy_n, nindivs, filters->ind_ignore.data(), filters->ind_in_analysis.data(), filters->has_missing.data(), params->ref_first, !params->split_by_pheno, Geno.data(), sums, trait_counts, &ctx);
+    // analyzed samples with missing values in some trait exist only outside strict mode (setMasks); they are
+    // recorded by the parser and removed from the per-trait counts afterwards (as update_trait_counts)
+    bool const track = !params->strict_mode;
+    static thread_local vector < uint32_t > hm_index;
+    static thread_local vector < double > hm_info;
+    if(track && (hm_index.size() < params->n_samples)) {
+      hm_index.resize(params->n_samples);
+      hm_info.resize(params->n_samples);
+    }
+    bgen8_parse_fast(buffer, ploidy_n, nindivs, filters->ind_ignore.data(), filters->ind_in_analysis.data(), track ? filters->has_missing.data() : nullptr, params->ref_first, !params->split_by_pheno, zero_out, Geno.data(), sums, hm_index.data(), hm_info.data());
+    if(sums.n_hm > 0)
+      bgen8_trait_counts(hm_index.data(), hm_info.data(), sums.n_hm, Geno.data(), masked_indivs.data(), masked_indivs.outerStride(), masked_indivs.cols(), snp_data->af.data(), snp_data->mac.data(), snp_data->info.data(), snp_data->ns.data());
     buffer += 2 * nindivs;
     total = sums.total; mac = sums.mac; info_num = sums.info_num;
     snp_data->ns1 += sums.ns1; snp_data->n_aa += sums.n_aa; snp_data->n_rr += sums.n_rr;
     n_missing = sums.n_missing; n_out = sums.n_out;
+    ns1 = sums.ns1; n_zero = sums.n_zero; n_two = sums.n_two;
 
   } else for(size_t i = 0; i < nindivs; i++) {
 
@@ -2542,7 +2567,8 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
     compute_genocounts(params->trait_mode==1 || params->trait_mode==3, non_par, mac, Geno, snp_data->genocounts, params->sex, filters->case_control_indices);
 
   // for SPA switch effect allele to minor allele
-  flip_geno(total, Geno, snp_data, params);
+  if(zero_out && (n_out > 0)) flip_geno_analyzed(total, Geno, filters->ind_in_analysis, snp_data, params);
+  else flip_geno(total, Geno, snp_data, params);
 
   // apply dominant/recessive encoding & recompute mean
   if(!params->build_mask && (params->test_type > 0)){
@@ -2590,8 +2616,15 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
   }
 
   // impute missing (a no-op when no dosage is missing and all samples are in the analysis)
-  if(!params->build_mask && ((n_missing > 0) || (fast_parse ? (n_out > 0) : !filters->ind_in_analysis.all())))
+  if(zero_out) { // samples not in the analysis are already 0
+    if(n_missing > 0) Geno = (Geno == -3).select(total, Geno);
+  } else if(!params->build_mask && ((n_missing > 0) || (fast_parse ? (n_out > 0) : !filters->ind_in_analysis.all())))
     mean_impute_g(total, Geno, filters->ind_in_analysis);
+
+  // non-zero entries among the analyzed samples, for check_sparse_G (after a flip 2 - g is 0 only for g = 2,
+  // and the n_missing imputed entries hold the mean; ns1 > 0 keeps the mean finite)
+  if(fast_parse && (params->test_type == 0) && (ns1 > 0))
+    snp_data->nnz = ns1 - (snp_data->flipped ? n_two : n_zero) + ((total != 0) ? n_missing : 0);
 
   return;
 }
@@ -3060,6 +3093,7 @@ void prep_snp_stats(variant_block* snp_data, struct param const* params){
   snp_data->skip_int = false;
   snp_data->fitHLM = false;
   snp_data->flipped = false;
+  snp_data->nnz = -1;
   snp_data->ns1 = 0, snp_data->n_rr = 0, snp_data->n_aa = 0;
   if (params->skip_dosage_comp) {
     snp_data->ns1_adj = 0;
@@ -3134,14 +3168,16 @@ void reset_stats(variant_block* snp_data, struct param const& params){
 
 void update_trait_counts(int const& index, double const& genoValue, double const& macValue, int const& sexValue, double const& infoValue, variant_block* snp_data, const Ref<const MatrixXb>& mask){
 
-  ArrayXi imask = 1 - mask.row(index).cast<int>().array(); // get masked samples
-
   // will subtract from total computed on all analyzed samples (masked & unmasked)
-  snp_data->af -= genoValue * imask.cast<double>();
-  snp_data->mac -= macValue * imask.cast<double>();
-  snp_data->info -= infoValue * imask.cast<double>();
-  snp_data->nmales -= imask * sexValue;
-  snp_data->ns -= imask;
+  // only the traits where the sample is masked change (the others would subtract +-0 from sums that are never -0)
+  for(int p = 0; p < mask.cols(); p++){
+    if( mask(index, p) ) continue;
+    snp_data->af(p) -= genoValue;
+    snp_data->mac(p) -= macValue;
+    snp_data->info(p) -= infoValue;
+    snp_data->nmales(p) -= sexValue;
+    snp_data->ns(p)--;
+  }
 
 }
 
@@ -3349,13 +3385,15 @@ void flip_geno(double& total, Ref<ArrayXd> Geno, variant_block* snp_data, struct
 }
 
 // for rarer variants, use sparse format
-void check_sparse_G(int const& isnp, int const& thread_num, struct geno_block* gblock, uint32_t const& nsamples, const Ref<const ArrayXb>& mask, int const& n_zero, const double& prop_zero_thr){
+void check_sparse_G(int const& isnp, int const& thread_num, struct geno_block* gblock, uint32_t const& nsamples, const Ref<const ArrayXb>& mask, int const& n_zero, const double& prop_zero_thr, int const& nnz){
 
   data_thread* snp_data = &(gblock->thread_data[thread_num]);
   MapArXd Geno ( gblock->Gmat.col(isnp).data(), nsamples, 1);
 
   if (n_zero != -1)
     snp_data->is_sparse = (n_zero >= (nsamples * prop_zero_thr));
+  else if (nnz != -1) // counted when parsing (same test as below)
+    snp_data->is_sparse = (nnz <= (nsamples * (1 - prop_zero_thr)));
   else
     snp_data->is_sparse = (mask && (Geno != 0)).count() <= (nsamples * (1 - prop_zero_thr));
 
@@ -3373,7 +3411,7 @@ void mean_impute_g(double &geno, const double& mu, const bool& in_analysis){
   else if(geno == -3) 
     geno = mu;
 }
-// impute all at once
+// impute all at once (the closed-form tests of step 2, cf_prepare/cf_variant, rely on the 0 outside the analysis)
 void mean_impute_g(const double& mu, Ref<ArrayXd> Geno, const Ref<const ArrayXb>& in_analysis){
   Geno = (!in_analysis).select(0, Geno);
   Geno = (in_analysis && (Geno == -3)).select(mu, Geno);

@@ -59,16 +59,21 @@ struct cf_block {
   bool active = false;
   int n_pheno = 0, trait_mode = 0;
   Eigen::MatrixXd W, S; // W: N x K known vectors; S = W^T G (K x block size)
-  // quantitative traits; W = [e | X | X_1 .. X_P | yres]
-  int ncov = 0;
+  // quantitative traits; W = [e | X | X_p of the traits in q_mask | yres] (yres from row y_row of S)
+  int ncov = 0, y_row = 0;
   bool center = false;
   double ete = 0;
   Eigen::VectorXd e, Xte, Yte;
-  Eigen::MatrixXd XtX, YtX, mask_t; // mask_t: P x N trait masks as 0/1
+  ArrayXb e_ind; // e as 0/1
+  Eigen::MatrixXd XtX, YtX;
+  // traits masked as the analysis have X_p = X and the sums of all samples (q_col = -1); the others have their
+  // mask in column k = q_col[p] of q_mask, and X_p^T g in rows 1 + C + k C of S
+  std::vector<int> q_col;
+  MatrixXb q_mask;
   std::vector<Eigen::VectorXd> Xpte;
   std::vector<Eigen::MatrixXd> XptXp;
-  // binary traits, per trait p; W = [gamma_p^2 | X_Gamma_p o gamma_p | gamma_p o yres_p] for each p
-  std::vector<int> col, ncov_p;
+  // binary traits, per trait p; W = [gamma_p^2 | X_Gamma_p o gamma_p | gamma_p o yres_p] for each p in traits
+  std::vector<int> col, ncov_p, traits;
   std::vector<bool> center_p;
   std::vector<double> g2_sum, gy;
   std::vector<Eigen::VectorXd> Xwg, Xwy;
