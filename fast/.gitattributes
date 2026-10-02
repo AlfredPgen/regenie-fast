@@ -1,0 +1,3 @@
+# Check out the text files in fast/ with LF line endings on every system, including Git for Windows with
+# core.autocrlf=true, so that the scripts run in bash and make_package.sh accepts them.
+* text=auto eol=lf

@@ -1,0 +1,6 @@
+QUADPACK (R. Piessens, E. de Doncker-Kapenga, C. Ueberhuber, D. Kahaner) and D1MACH, Fortran code from
+netlib (http://www.netlib.org/quadpack/, http://netlib.org/blas/d1mach.f), included in regenie as
+external_libs/quadpack and compiled into both programs.
+==============================================================================
+
+Neither the files nor netlib state a licence. QUADPACK is commonly described as public domain software.

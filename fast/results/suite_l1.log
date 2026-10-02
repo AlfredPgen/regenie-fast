@@ -1,0 +1,23 @@
+s1_qt: identical (13.13 s)
+s1_qt1: identical (11.56 s)
+s1_bt: identical (12.42 s)
+s1_missing: identical (14.42 s)
+g1_qt: identical (43.17 s)
+g1_bt: identical (98.73 s)
+s2_bgen_qt2: identical (3.20 s)
+s2_bgen_qt1: identical (2.21 s)
+s2_bgen_missing: identical (2.55 s)
+s2_bgen_bt_firth01: identical (2.58 s)
+s2_bgen_bt_firth05: identical (2.97 s)
+s2_bgen_bt_spa: identical (2.03 s)
+s2_bgen_bt_plain: identical (1.85 s)
+s2_allpairs_qt2: identical (0.11 s)
+s2_allpairs_ref: identical (0.09 s)
+s2_bed_qt2: identical (2.33 s)
+s2_bed_bt: identical (2.63 s)
+e2e_qt: identical
+e2e_bt: identical
+threads 1 vs 4, s1_qt: candidate identical, official identical
+threads 1 vs 4, s2_bgen_qt2: candidate identical, official identical
+threads 1 vs 4, s2_bgen_bt_firth01: candidate identical, official identical
+SUITE l1: ALL IDENTICAL

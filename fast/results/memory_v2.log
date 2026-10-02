@@ -1,0 +1,18 @@
+step1_qt official max RSS  328880 KiB =  321.2 MiB, elapsed 102.01 s
+step1_qt fast     max RSS  295400 KiB =  288.5 MiB, elapsed 25.60 s
+  options: --step 1  --bed geno  --extract s1_50k.txt  --covarFile covar.txt  --phenoFile pheno.txt  --bsize 1000  --threads 2 
+step1_bt official max RSS  301636 KiB =  294.6 MiB, elapsed 96.06 s
+step1_bt fast     max RSS  276136 KiB =  269.7 MiB, elapsed 26.00 s
+  options: --step 1  --bed geno  --extract s1_50k.txt  --covarFile covar.txt  --phenoFile bt.txt  --bt  --bsize 1000  --threads 2 
+step2_qt official max RSS   63148 KiB =   61.7 MiB, elapsed 4.33 s
+step2_qt fast     max RSS   61784 KiB =   60.3 MiB, elapsed 1.98 s
+  options: --step 2  --bgen imp.bgen  --sample imp.sample  --covarFile covar.txt  --phenoFile pheno.txt  --pred ~/rgprof/ref/s1_qt_pred.list  --bsize 400  --threads 2 
+step2_bt official max RSS   66440 KiB =   64.9 MiB, elapsed 3.84 s
+step2_bt fast     max RSS   63624 KiB =   62.1 MiB, elapsed 1.88 s
+  options: --step 2  --bgen imp.bgen  --sample imp.sample  --covarFile covar.txt  --phenoFile bt.txt  --bt  --firth  --approx  --pThresh 0.01  --pred ~/rgprof/ref/s1_bt_pred.list  --bsize 400  --threads 2 
+step1_qt_official_1.loco vs fast: identical
+step1_qt_official_2.loco vs fast: identical
+step1_bt_official_1.loco vs fast: identical
+step2_qt_official_Y1.regenie vs fast: identical
+step2_qt_official_Y2.regenie vs fast: identical
+step2_bt_official_B1.regenie vs fast: identical

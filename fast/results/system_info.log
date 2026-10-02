@@ -1,0 +1,8 @@
+Ubuntu 26.04.1 LTS
+6.18.33.1-microsoft-standard-WSL2
+8
+model name	: 11th Gen Intel(R) Core(TM) i7-11370H @ 3.30GHz
+               total        used        free      shared  buff/cache   available
+Mem:               7           2           0           0           4           5
+/dev/sdd       ext4 1055762868 4781416 997277980   1% /
+recorded 2026-10-02

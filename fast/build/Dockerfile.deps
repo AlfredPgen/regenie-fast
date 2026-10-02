@@ -1,0 +1,42 @@
+# Toolchain and libraries for building regenie-fast: the same recipe as regenie's own Dockerfile_mkl
+# (Ubuntu 22.04, gcc 9, BGEN 1.1.7, HTSlib 1.18, Intel oneAPI MKL), without the regenie source.
+#
+# Build (from the repository root; the context directory is unused, so fast/build keeps it small):
+#   docker build -t regenie-deps:mkl2024.2 -f fast/build/Dockerfile.deps fast/build
+#
+# Intel MKL is pinned to 2024.2.0, the MKL version inside the official regenie v4.1.3 MKL release binary (with
+# MKL_VERBOSE=1 both report "oneMKL 2024.0 Update 2 Product build 20240605", the version string of the 2024.2.0
+# packages). MKL chooses its numerical kernels by version and CPU, so with any other MKL version even unchanged regenie
+# code can print different last digits than the official release. Pinning 2024.2.0 makes the identical-results checks
+# in fast/verify measure the source changes rather than MKL version differences.
+FROM public.ecr.aws/ubuntu/ubuntu:22.04
+ARG CMAKE_VERSION_MAJOR=3.13
+ARG CMAKE_VERSION_MINOR=0
+ARG HTSLIB_VERSION=1.18
+ARG MKL_PKGS="intel-oneapi-mkl-core-2024.2=2024.2.0-663 intel-oneapi-mkl-core-common-2024.2=2024.2.0-663 intel-oneapi-mkl-core-devel-2024.2=2024.2.0-663 intel-oneapi-mkl-core-devel-common-2024.2=2024.2.0-663 intel-oneapi-mkl-classic-include-2024.2=2024.2.0-663 intel-oneapi-mkl-classic-include-common-2024.2=2024.2.0-663"
+WORKDIR /src
+ADD http://cmake.org/files/v${CMAKE_VERSION_MAJOR}/cmake-${CMAKE_VERSION_MAJOR}.${CMAKE_VERSION_MINOR}-Linux-x86_64.sh cmake_install.sh
+ADD http://code.enkre.net/bgen/tarball/release/v1.1.7 v1.1.7.tgz
+ADD https://github.com/samtools/htslib/releases/download/$HTSLIB_VERSION/htslib-$HTSLIB_VERSION.tar.bz2 htslib-$HTSLIB_VERSION.tar.bz2
+ADD https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB intel_key.PUB
+# checksums of the downloads above, recorded for the v4.1.3-fast1 release (update them if you change a version)
+RUN printf '%s\n' \
+      "97220140fb5be4f1fa35600f7b45dd82d168c966dfbb877cae2bad4064b0d31b  cmake_install.sh" \
+      "6476b077af6c8e98e85fd7e09f58cb3fdf143ff91850c984248fd4dc2d74a8c3  v1.1.7.tgz" \
+      "f1ab53a593a2320a1bfadf4ef915dae784006c5b5c922c8a8174d7530a9af18f  htslib-1.18.tar.bz2" \
+      "db932ba032a71f732dc415eef5f4f185fc7ae768487d7a357bc2772746b6c48c  intel_key.PUB" \
+    | sha256sum -c -
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      gcc-9 g++-9 gfortran-9 libz-dev bzip2 libbz2-dev liblzma-dev libcurl4-openssl-dev libssl-dev \
+      make gnupg python3 zlib1g-dev apt-transport-https ca-certificates libboost-iostreams-dev \
+      && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-9 60 --slave /usr/bin/g++ g++ /usr/bin/g++-9 \
+      && update-alternatives --install /usr/bin/gfortran gfortran /usr/bin/gfortran-9 70 \
+      && update-alternatives --install /usr/bin/f77 f77 /usr/bin/gfortran-9 70 \
+      && update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-9 70 \
+      && tar -xf htslib-$HTSLIB_VERSION.tar.bz2 && cd htslib-$HTSLIB_VERSION/ && ./configure && make -j4 && make install && cd .. \
+      && sh cmake_install.sh --prefix=/usr/local --skip-license --exclude-subdir && rm cmake_install.sh \
+      && tar -xzf v1.1.7.tgz && rm v1.1.7.tgz && cd v1.1.7 && python3 waf configure && python3 waf -j4 && cd .. \
+      && sh -c 'cat intel_key.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null' \
+      && sh -c 'echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list' \
+      && apt-get update && apt-get install $MKL_PKGS -y --no-install-recommends \
+      && rm -rf /var/lib/apt/lists/*

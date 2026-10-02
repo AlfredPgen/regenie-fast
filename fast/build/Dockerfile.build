@@ -1,0 +1,29 @@
+# Compiles this repository with the same settings as the official regenie MKL release (static MKL and Boost
+# Iostreams, STATIC=1), on the image from Dockerfile.deps, plus libdeflate for the faster BGEN reader.
+#
+# Build (from the repository root, which is the build context):
+#   docker build -t regenie-deps:mkl2024.2 -f fast/build/Dockerfile.deps fast/build
+#   docker build -t regenie-fast-build:v4.1.3-fast1 -f fast/build/Dockerfile.build .
+# Copy the program out of the image:
+#   c=$(docker create regenie-fast-build:v4.1.3-fast1)
+#   docker cp "$c":/src/regenie/regenie ./regenie-4.1.3-fast && docker rm "$c"
+# (fast/package/make_package.sh --build-image regenie-fast-build:v4.1.3-fast1 does this copy itself.)
+#
+# The build context is filtered by Dockerfile.build.dockerignore next to this file (BuildKit uses it instead of the
+# repository's .dockerignore), so fast/, docs/, example/ and test/ are not copied into the image.
+ARG DEPS_IMAGE=regenie-deps:mkl2024.2
+FROM ${DEPS_IMAGE}
+# libdeflate 1.26 (static, position-independent): regenie's CMakeLists.txt links it when found and then inflates
+# zlib-compressed BGEN genotype blocks with it; without it the build falls back to zlib (slower, same results)
+ADD https://github.com/ebiggers/libdeflate/releases/download/v1.26/libdeflate-1.26.tar.gz /src/libdeflate.tar.gz
+RUN echo "125856d4656e0feab660f94842f835923410c9281fedbcee64598c918da42b5a  /src/libdeflate.tar.gz" | sha256sum -c - \
+    && cd /src && tar -xzf libdeflate.tar.gz && cd libdeflate-1.26 \
+    && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLIBDEFLATE_BUILD_SHARED_LIB=OFF -DLIBDEFLATE_BUILD_GZIP=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    && cmake --build build --target install -- -j2
+COPY . /src/regenie
+ARG JOBS=2
+RUN . /opt/intel/oneapi/setvars.sh \
+    && cd /src/regenie \
+    && BGEN_PATH=/src/v1.1.7 HAS_BOOST_IOSTREAM=1 MKLROOT=$MKLROOT HTSLIB_PATH=/usr/local/lib/ STATIC=1 cmake . \
+    && make -j${JOBS} \
+    && ./regenie --version

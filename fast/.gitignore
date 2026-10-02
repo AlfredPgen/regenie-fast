@@ -1,0 +1,2 @@
+# The repository's .gitignore ignores every folder named build/; keep this one.
+!/build/

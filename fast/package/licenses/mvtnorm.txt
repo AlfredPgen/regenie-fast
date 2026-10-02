@@ -1,0 +1,21 @@
+MVTDST: Fortran code by Alan Genz for multivariate normal and t probabilities, included in regenie as
+external_libs/mvtnorm (mvt.f, randomF77.c, plus regenie's C wrapper mvtnorm.cpp) and compiled into both programs.
+==============================================================================
+
+mvt.f states its origin as follows:
+
+    $Id: mvt.f 231 2011-11-07 13:48:07Z thothorn $
+    A subroutine for computing non-central multivariate t probabilities.
+    This subroutine uses an algorithm (QRSVN) described in the paper
+    "Comparison of Methods for the Computation of Multivariate
+        t-Probabilities", by Alan Genz and Frank Bretz
+        J. Comp. Graph. Stat. 11 (2002), pp. 950-971.
+         Alan Genz, Department of Mathematics, Washington State University
+    Original source available from
+    http://www.math.wsu.edu/faculty/genz/software/fort77/mvtdstpack.f
+
+The "$Id" line identifies the copy as taken from the R package mvtnorm
+(https://cran.r-project.org/package=mvtnorm), which is distributed under GPL-2. randomF77.c also comes
+from that package; in regenie it contains only three one-line stub functions. Neither file states a
+licence of its own, and regenie's LICENSE does not mention them. Alan Genz has also released his
+multivariate normal code under BSD-style terms elsewhere (for example the copy in SciPy).

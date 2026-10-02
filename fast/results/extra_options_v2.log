@@ -1,0 +1,11 @@
+d8dc4118a895cd179e1fdef53d4caee8536a45aeb5aab69ac8c78e2e8e3c0055  ~/rgprof/bin/regenie_official
+61cbf8994d43d547929718e6f33b3d63255ad1bda3314e7eba4f06d74e9fa6c5  ~/rgprof/bin/regenie_merged
+lowmem_bt_1.loco: identical
+lowmem_qt_1.loco: identical
+lowmem_qt_2.loco: identical
+split_qt_l1_1.loco: identical
+split_qt_l1_2.loco: identical
+gz_bt_B1.regenie.gz: identical
+gz_qt_Y1.regenie.gz: identical
+gz_qt_Y2.regenie.gz: identical
+EXTRA OPTIONS: 8 files compared, 0 differ

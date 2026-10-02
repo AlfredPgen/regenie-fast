@@ -1,0 +1,10 @@
+geno.fam samples: 10000
+geno.bim SNPs per chromosome: {'1': 10000, '2': 10000, '3': 10000, '4': 10000, '5': 10000, '6': 10000, '7': 10000, '8': 10000, '9': 10000, '10': 10000}
+s1_extract.txt SNPs per chromosome: {'1': 10000, '2': 10000}
+bt.txt: cases 1500 controls 8500
+covar.txt columns: ['PC1', 'PC2', 'PC3', 'AGE']
+pheno_miss.txt: NA in Y1 150 NA in Y2 47 NA in both 47
+remove.txt samples: 20
+allpairs.bgen: valid 8-bit pairs 32896 covered 32896 occurrences per pair min 87 max 93 missing genotypes 1001
+example data (package test/): 500 samples
+example.fam samples: 500, example.bim SNPs: 1000

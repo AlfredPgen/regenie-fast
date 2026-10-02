@@ -1,0 +1,6 @@
+d8dc4118a895cd179e1fdef53d4caee8536a45aeb5aab69ac8c78e2e8e3c0055  regenie_official
+61cbf8994d43d547929718e6f33b3d63255ad1bda3314e7eba4f06d74e9fa6c5  regenie_merged
+g1_bt official max RSS  452204 KiB =  441.6 MiB
+g1_bt fast     max RSS  646912 KiB =  631.8 MiB
+  options: --step 1 --bed geno --covarFile covar.txt --phenoFile bt.txt --bt --bsize 200 --threads 2
+g1_bt_official_1.loco vs fast: identical

@@ -1,0 +1,63 @@
+=== STEP 1 (LOCO predictions)
+  qt, trait 1: 230000 LOCO values; largest difference unchanged vs patched = 8.7e-15 of largest value; printed .loco vs official: identical
+  qt, trait 2: 230000 LOCO values; largest difference unchanged vs patched = 1.1e-14 of largest value; printed .loco vs official: identical
+  qt1, trait 1: 230000 LOCO values; largest difference unchanged vs patched = 7.9e-15 of largest value; printed .loco vs official: identical
+  bt, trait 1: 230000 LOCO values; largest difference unchanged vs patched = 9.3e-15 of largest value; printed .loco vs official: identical
+  missing, trait 1: 229540 LOCO values; largest difference unchanged vs patched = 9.1e-15 of largest value; printed .loco vs official: identical
+  missing, trait 2: 229540 LOCO values; largest difference unchanged vs patched = 7.5e-15 of largest value; printed .loco vs official: identical
+=== STEP 2 (association tests, same step 1 input)
+== allpairs_qt2
+  parse: 300 variants, bit-identical
+  score: 600 variant x trait results, 0 bit-identical; largest difference: stat 4.6e-13 (absolute), bhat 1.1e-09 (relative), se 2.3e-14 (relative), lp 4.9e-13 (absolute)
+  Y1.regenie: 300 variants, 0 lines differ from official
+  Y2.regenie: 300 variants, 0 lines differ from official
+== allpairs_qt1
+  parse: 300 variants, bit-identical
+  score: 300 variant x trait results, 0 bit-identical; largest difference: stat 4.6e-13 (absolute), bhat 2.1e-10 (relative), se 2.0e-14 (relative), lp 4.9e-13 (absolute)
+  Y1.regenie: 300 variants, 0 lines differ from official
+== allpairs_ref
+  parse: 300 variants, bit-identical
+  score: 600 variant x trait results, 0 bit-identical; largest difference: stat 4.6e-13 (absolute), bhat 1.2e-09 (relative), se 1.9e-14 (relative), lp 4.9e-13 (absolute)
+  Y1.regenie: 300 variants, 0 lines differ from official
+  Y2.regenie: 300 variants, 0 lines differ from official
+== bgen_qt2
+  parse: 5000 variants, bit-identical
+  score: 10000 variant x trait results, 0 bit-identical; largest difference: stat 6.0e-12 (absolute), bhat 4.5e-09 (relative), se 9.1e-14 (relative), lp 6.2e-12 (absolute)
+  Y1.regenie: 5000 variants, 0 lines differ from official
+  Y2.regenie: 5000 variants, 0 lines differ from official
+== bgen_qt1
+  parse: 5000 variants, bit-identical
+  score: 5000 variant x trait results, 0 bit-identical; largest difference: stat 6.0e-12 (absolute), bhat 3.2e-09 (relative), se 9.2e-14 (relative), lp 6.2e-12 (absolute)
+  Y1.regenie: 5000 variants, 0 lines differ from official
+== bgen_missing
+  parse: 5000 variants, bit-identical
+  score: 10000 variant x trait results, 0 bit-identical; largest difference: stat 7.1e-12 (absolute), bhat 4.2e-08 (relative), se 1.3e-13 (relative), lp 6.9e-12 (absolute)
+  Y1.regenie: 5000 variants, 0 lines differ from official
+  Y2.regenie: 5000 variants, 0 lines differ from official
+== bgen_bt_firth
+  parse: 5000 variants, bit-identical
+  score: 5000 variant x trait results, 25 bit-identical; largest difference: stat 1.2e-14 (absolute), bhat 2.6e-11 (relative), se 5.6e-15 (relative), lp 1.3e-14 (absolute)
+  B1.regenie: 5000 variants, 0 lines differ from official
+== bgen_bt_spa
+  parse: 5000 variants, bit-identical
+  score: 5000 variant x trait results, 24 bit-identical; largest difference: stat 1.2e-14 (absolute), bhat 2.6e-11 (relative), se 5.6e-15 (relative), lp 1.3e-14 (absolute)
+  B1.regenie: 5000 variants, 0 lines differ from official
+== bgen_bt_plain
+  parse: 5000 variants, bit-identical
+  score: 5000 variant x trait results, 24 bit-identical; largest difference: stat 1.2e-14 (absolute), bhat 2.6e-11 (relative), se 5.6e-15 (relative), lp 1.6e-14 (absolute)
+  B1.regenie: 5000 variants, 0 lines differ from official
+== bed_qt2
+  score: 10000 variant x trait results, 0 bit-identical; largest difference: stat 3.8e-12 (absolute), bhat 5.5e-09 (relative), se 1.3e-13 (relative), lp 1.4e-11 (absolute)
+  Y1.regenie: 5000 variants, 0 lines differ from official
+  Y2.regenie: 5000 variants, 0 lines differ from official
+== bed_bt
+  score: 5000 variant x trait results, 2876 bit-identical; largest difference: stat 1.3e-14 (absolute), bhat 1.7e-12 (relative), se 5.2e-15 (relative), lp 1.1e-14 (absolute)
+  B1.regenie: 5000 variants, 0 lines differ from official
+=== END TO END (each build: its own step 1 -> its own step 2; final results compared)
+e2e_qt.fast_Y1.regenie: 5000 variants, 0 lines differ
+e2e_qt.fast_Y2.regenie: 5000 variants, 0 lines differ
+e2e_qt1.fast_Y1.regenie: 5000 variants, 0 lines differ
+e2e_bt.fast_B1.regenie: 5000 variants, 0 lines differ
+DONE threads=1
+DONE threads=2
+ALLDONE

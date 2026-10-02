@@ -1,0 +1,52 @@
+pgenlib: the PLINK 2.0 .pgen reader (pgenlibr), included in regenie as external_libs/pgenlib and compiled
+into both programs (static library pgenlib.a). Upstream: https://github.com/chrchang/plink-ng (2.0/pgenlibr).
+regenie's copy was modified by Joelle Mbatchou (2020) to remove the R interface.
+
+    This library is part of PLINK 2.0, copyright (C) 2005-2024 Shaun Purcell,
+    Christopher Chang.
+
+    This library is free software: you can redistribute it and/or modify it
+    under the terms of the GNU Lesser General Public License as published by the
+    Free Software Foundation; either version 3 of the License, or (at your
+    option) any later version.
+
+    This library is distributed in the hope that it will be useful, but WITHOUT
+    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+    FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License
+    for more details.
+
+Full texts: LGPL-3.0.txt and GPL-3.0.txt (the LGPL v3 incorporates the GPL v3).
+The source of pgenlib as compiled is in this repository under external_libs/pgenlib.
+
+pgenlib uses SIMDe (SIMD Everywhere, https://github.com/simd-everywhere/simde), header-only, in
+external_libs/pgenlib/simde. Most SIMDe files are under the MIT licence below; hedley.h, check.h and
+debug-trap.h are dedicated to the public domain under CC0-1.0 (Evan Nemerson).
+==============================================================================
+
+/* SPDX-License-Identifier: MIT
+ *
+ * Permission is hereby granted, free of charge, to any person
+ * obtaining a copy of this software and associated documentation
+ * files (the "Software"), to deal in the Software without
+ * restriction, including without limitation the rights to use, copy,
+ * modify, merge, publish, distribute, sublicense, and/or sell copies
+ * of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be
+ * included in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ *
+ * Copyright:
+ *   2017-2020 Evan Nemerson <evan@nemerson.com>
+ *   2023      Yi-Yen Chung <eric681@andestech.com> (Copyright owned by Andes Technology)
+ *   2023      Ju-Hung Li <jhlee@pllab.cs.nthu.edu.tw> (Copyright owned by NTHU pllab)
+ */

@@ -1,0 +1,10 @@
+SQLite 3.9.2 (source id 2015-11-02 18:31:45 bda77dda9697c463c3d0704014d51627fceee328), bundled with
+BGEN v1.1.7 in 3rd_party/sqlite3 and compiled into both programs.
+==============================================================================
+
+SQLite is in the public domain (https://www.sqlite.org/copyright.html). In place of a legal notice,
+its source code carries this blessing:
+
+    May you do good and not evil.
+    May you find forgiveness for yourself and forgive others.
+    May you share freely, never taking more than you give.

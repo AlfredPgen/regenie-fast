@@ -1,0 +1,8 @@
+qfc: C code by Robert Davies for the distribution of a linear combination of chi-squared variables
+(Davies, R. B. (1980), Algorithm AS 155, Applied Statistics 29, 323-333), included in regenie as
+external_libs/qf and compiled into both programs.
+==============================================================================
+
+The regenie copy says: "Code was obtained from Robert Davies' webpage
+(http://www.robertnz.net/download.html) and was modified to remove the use of functions from `setjmp`
+library" (modification by J. Mbatchou, 2021). The code and the download page state no licence terms.

@@ -1,3 +1,31 @@
+# regenie-fast: a faster build of regenie v4.1.3
+
+**This repository is a fork of [rgcgithub/regenie](https://github.com/rgcgithub/regenie) v4.1.3 with performance changes. It is not an official regenie release.** The options, input formats and output files are those of regenie v4.1.3. In every configuration we tested, each step 1 `.loco` file and step 2 `.regenie` file it wrote was byte-identical to the file written by the official v4.1.3 release program. [fast/VERIFICATION.md](fast/VERIFICATION.md) lists what was tested and what was not.
+
+| Threads | Run (simulated data, 10,000 samples) | Official v4.1.3 | regenie-fast | Speed-up |
+|---|---|---|---|---|
+| 1 | Step 1, 2 quantitative traits, 50,000 SNPs | 120.3 s | 29.5 s | 4.1x |
+| 1 | Step 1, 1 binary trait, 50,000 SNPs | 117.0 s | 28.8 s | 4.1x |
+| 1 | Step 2, 2 quantitative traits, 20,000 BGEN variants | 6.2 s | 3.0 s | 2.1x |
+| 1 | Step 2, 1 binary trait with approximate Firth correction, 20,000 BGEN variants | 5.7 s | 2.9 s | 2.0x |
+| 2 | Step 1, 1 binary trait, 100,000 SNPs (2,500 level 1 predictors) | 134.4 s | 84.9 s | 1.6x |
+| 4 | Step 1, 2 quantitative traits, 50,000 SNPs | 70.5 s | 18.0 s | 3.9x |
+| 4 | Step 2, 2 quantitative traits, 20,000 BGEN variants | 2.0 s | 1.0 s | 1.9x |
+
+Wall time, mean of 2 or 3 rounds on one laptop (Intel Core i7-11370H). Conditions and all results are in [fast/BENCHMARKS.md](fast/BENCHMARKS.md). The gain on your data and hardware will differ; the download includes a script that times both programs on your own command.
+
+- **Download:** [release v4.1.3-fast1](https://github.com/AlfredPgen/regenie-fast/releases/tag/v4.1.3-fast1), file `regenie-fast-linux-x86_64.zip`. It runs on x86-64 Linux without installation and includes the official v4.1.3 program and a self-test.
+- **Documentation:** [overview and quick start](fast/README.md), [what changed](fast/CHANGES.md), [verification](fast/VERIFICATION.md), [benchmarks](fast/BENCHMARKS.md).
+- **Support:** please report problems with this build in [this repository's issues](https://github.com/AlfredPgen/regenie-fast/issues), not to the regenie developers.
+- **Credit:** regenie is developed by Joelle Mbatchou, Andrey Ziyatdinov, Jonathan Marchini and colleagues at the Regeneron Genetics Center. The method and nearly all of the code are theirs. If you use regenie-fast, please cite regenie:
+  Mbatchou, J., Barnard, L., Backman, J. et al. Computationally efficient whole-genome regression for quantitative and binary traits. *Nat Genet* 53, 1097–1103 (2021). https://doi.org/10.1038/s41588-021-00870-7
+
+---
+
+*The original regenie README follows, unchanged.*
+
+---
+
 [![build](https://github.com/rgcgithub/regenie/actions/workflows/test.yml/badge.svg)](https://github.com/rgcgithub/regenie/actions/workflows/test.yml)
 ![GitHub release (latest by date)](https://img.shields.io/github/v/release/rgcgithub/regenie?logo=Github)
 [![install with conda](https://img.shields.io/badge/install%20with-conda-brightgreen.svg)](https://anaconda.org/bioconda/regenie)

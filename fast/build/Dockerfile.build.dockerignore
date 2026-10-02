@@ -1,0 +1,17 @@
+# Build context filter for fast/build/Dockerfile.build (BuildKit reads <Dockerfile>.dockerignore instead of the
+# repository's .dockerignore). Same entries as the repository's .dockerignore, plus the folders a build never needs.
+.git
+.gitignore
+.github
+example/
+test/
+recipe/
+docs/
+fast/
+src/*.o
+external_libs/pgenlib/*.o
+external_libs/pgenlib/include/*.o
+CMakeCache.txt
+CMakeFiles/
+README.md
+LICENSE

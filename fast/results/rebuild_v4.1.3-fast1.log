@@ -1,0 +1,28 @@
+Rebuild of the regenie-fast release program with the published recipe
+
+date:          2026-10-02 20:29:09 UTC to 2026-10-02 20:37:37 UTC
+source:        fresh git clone of this repository (core.autocrlf=false). The build context is the repository
+               minus the paths in fast/build/Dockerfile.build.dockerignore (fast/, docs/, example/, test/,
+               README.md, LICENSE, .git...). Its git objects, the same in tag v4.1.3-fast1
+               (check with: git ls-tree v4.1.3-fast1 -- CMakeLists.txt Makefile VERSION src external_libs scripts .dockerignore Dockerfile Dockerfile_mkl Dockerfile_openblas RELEASE_LOG.md):
+                 100644 blob b3109c63068a3fa0f2c6c3778a667c8a93c9b0bf	.dockerignore
+                 100755 blob d3cfd1f54b70cb625790bd0af376b867ae35ecd3	CMakeLists.txt
+                 100644 blob 06cf82878fa6855d8dc2b1dee3e5966a32aa39ff	Dockerfile
+                 100644 blob f9665349645ece0046d79b6b264892a98bacc671	Dockerfile_mkl
+                 100644 blob 051258c2b3259ca181a1beb2eb08216326e73c34	Dockerfile_openblas
+                 100755 blob ee86679fee130c41e907c2632d3edc18a5a6e023	Makefile
+                 100644 blob 00c83c68b53cfb49a49c41c10e77e66177277182	RELEASE_LOG.md
+                 100644 blob de197cc337f3264749879491cb01a188566e5cc5	VERSION
+                 040000 tree 29744f6240c18a7267707a7d96b33ca8b9e28e73	external_libs
+                 040000 tree 6deb7e097b4d0b9e0d08b7e7ba2932489629b30b	scripts
+                 040000 tree 4f1e646cdf9312b53a3789abad31f57efc298ba0	src
+deps image:    regenie-deps:mkl2024.2 sha256:9815e76f937d1057a92d19101bc25c983a046303c64d2e02239d50feee8e0737
+               (the deps image used for the release, built with fast/build/Dockerfile.deps before its
+               download checksums were added; package list in fast/build/deps-image-packages.txt)
+command:       docker build --no-cache -t regenie-fast-build:rebuild-check -f fast/build/Dockerfile.build .
+               c=$(docker create regenie-fast-build:rebuild-check)
+               docker cp "$c":/src/regenie/regenie ./regenie-4.1.3-fast
+build:         exit status 0; regenie --version printed v4.1.3.gz
+sha256:        61cbf8994d43d547929718e6f33b3d63255ad1bda3314e7eba4f06d74e9fa6c5  regenie-4.1.3-fast (rebuilt)
+release:       61cbf8994d43d547929718e6f33b3d63255ad1bda3314e7eba4f06d74e9fa6c5  bin/regenie-4.1.3-fast (tested program, release zip)
+result:        IDENTICAL: the rebuilt program is bit for bit the release program

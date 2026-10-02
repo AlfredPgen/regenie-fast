@@ -1,0 +1,88 @@
+Eigen 3.4.0 (header-only C++ library), included in regenie as external_libs/eigen-3.4.0/Eigen and
+compiled into both programs. Source: https://gitlab.com/libeigen/eigen/-/tree/3.4.0
+
+Most of Eigen is under the Mozilla Public License 2.0 (full text: MPL-2.0.txt). The Eigen headers that
+regenie uses contain no LGPL-licensed code (none of them includes Eigen/src/Core/util/NonMPL2.h).
+Files under other licences:
+ - Intel MKL / BLAS / LAPACKE bindings (Eigen/src/*/*_BLAS.h, *_LAPACKE.h, Core/Assign_MKL.h,
+   Core/util/MKL_support.h, PardisoSupport/PardisoSupport.h): BSD-3-Clause, Copyright (c) 2011,
+   Intel Corporation (text below). regenie enables these bindings (EIGEN_USE_BLAS, EIGEN_USE_LAPACKE).
+ - Eigen/src/Core/arch/Default/BFloat16.h: Apache License 2.0, Copyright 2017 The TensorFlow Authors
+   (full text: Apache-2.0.txt).
+ - Eigen/src/Core/arch/Default/Half.h: conversion routines Copyright (c) Fabian Giesen, 2016 (text below).
+
+Eigen's COPYING.README (from the Eigen 3.4.0 source distribution) follows, then COPYING.BSD and the Half.h notice.
+==============================================================================
+
+Eigen is primarily MPL2 licensed. See COPYING.MPL2 and these links:
+  http://www.mozilla.org/MPL/2.0/
+  http://www.mozilla.org/MPL/2.0/FAQ.html
+
+Some files contain third-party code under BSD or LGPL licenses, whence the other
+COPYING.* files here.
+
+All the LGPL code is either LGPL 2.1-only, or LGPL 2.1-or-later.
+For this reason, the COPYING.LGPL file contains the LGPL 2.1 text.
+
+If you want to guarantee that the Eigen code that you are #including is licensed
+under the MPL2 and possibly more permissive licenses (like BSD), #define this
+preprocessor symbol:
+  EIGEN_MPL2_ONLY
+For example, with most compilers, you could add this to your project CXXFLAGS:
+  -DEIGEN_MPL2_ONLY
+This will cause a compilation error to be generated if you #include any code that is
+LGPL licensed.
+
+==============================================================================
+COPYING.BSD
+==============================================================================
+
+/*
+ Copyright (c) 2011, Intel Corporation. All rights reserved.
+
+ Redistribution and use in source and binary forms, with or without modification,
+ are permitted provided that the following conditions are met:
+
+ * Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+ * Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+ * Neither the name of Intel Corporation nor the names of its contributors may
+   be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
+==============================================================================
+Eigen/src/Core/arch/Default/Half.h
+==============================================================================
+
+// The conversion routines are Copyright (c) Fabian Giesen, 2016.
+// The original license follows:
+//
+// Copyright (c) Fabian Giesen, 2016
+// All rights reserved.
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted.
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
