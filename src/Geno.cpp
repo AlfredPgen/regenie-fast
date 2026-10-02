@@ -2279,6 +2279,7 @@ void readChunkFromBGEN(std::istream* bfile, vector<uint32_t>& insize, vector<uin
   uint32_t position = 0, allele_size = 0;
   int n_snps = indices.size();
   string tmp_buffer;
+  uint64 next_pos = 0; // stream position after the previous record
 
   // extract genotype data blocks single-threaded
   for(int isnp = 0; isnp < n_snps; isnp++) {
@@ -2288,7 +2289,10 @@ void readChunkFromBGEN(std::istream* bfile, vector<uint32_t>& insize, vector<uin
     uint32_t* size1 = &insize[isnp];
     uint32_t* size2 = &outsize[isnp];
 
-    bfile->seekg( indices[isnp] );
+    // seek only if the record does not start where the previous one ended (a seek drops the stream buffer)
+    if( (isnp == 0) || (indices[isnp] != next_pos) )
+      bfile->seekg( indices[isnp] );
+    uint64 rec_size = 2 + 2 + 2 + 4 + 2 + 4 + 4 + 4 + 4; // fixed-size fields of the record
 
     // snpid
     bfile->read( reinterpret_cast<char *> (&SNPID_size), 2 );
@@ -2302,6 +2306,7 @@ void readChunkFromBGEN(std::istream* bfile, vector<uint32_t>& insize, vector<uin
     bfile->read( reinterpret_cast<char *> (&chromosome_size), 2 );
     tmp_buffer.resize(chromosome_size);
     bfile->read( reinterpret_cast<char *> (&tmp_buffer[0]), chromosome_size );
+    rec_size += SNPID_size + RSID_size + chromosome_size;
     // position
     bfile->read( reinterpret_cast<char *> (&position), 4 );
     // number of alleles
@@ -2310,15 +2315,19 @@ void readChunkFromBGEN(std::istream* bfile, vector<uint32_t>& insize, vector<uin
     bfile->read( reinterpret_cast<char *> (&allele_size), 4 );
     tmp_buffer.resize(allele_size);
     bfile->read( reinterpret_cast<char *> (&tmp_buffer[0]), allele_size );
+    rec_size += allele_size;
     bfile->read( reinterpret_cast<char *> (&allele_size), 4 );
     tmp_buffer.resize(allele_size);
     bfile->read( reinterpret_cast<char *> (&tmp_buffer[0]), allele_size );
+    rec_size += allele_size;
 
     // set genotype data block
     bfile->read( reinterpret_cast<char *> (size1), 4 );
     bfile->read( reinterpret_cast<char *> (size2), 4);
     geno_block->resize(*size1 - 4);
     bfile->read( reinterpret_cast<char *> (&((*geno_block)[0])), *size1 - 4);
+    rec_size += *size1 - 4;
+    next_pos = indices[isnp] + rec_size;
 
   }
 

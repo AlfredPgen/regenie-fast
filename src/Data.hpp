@@ -123,6 +123,9 @@ class Data {
     void run_SPA_test(int const&);
 
     // step2 using multithreading in openmp
+    cf_block cf_cache; // closed-form block statistics of the current chromosome (test_snps_fast only)
+    bool cf_cache_on = false;
+    int bgen_fd = -1; // BGEN file read per variant by the threads parsing a block (test_snps_fast only, -1 if not used)
     void test_snps_fast();
     void analyze_block(int const&,int const&,tally*,std::vector<variant_block>&);
     void compute_tests_mt(int const&,std::vector<uint64>,std::vector<std::vector <uchar>>&,std::vector<uint32_t>,std::vector<uint32_t>&,std::vector<variant_block>&);

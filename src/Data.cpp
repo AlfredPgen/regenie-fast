@@ -26,6 +26,14 @@
 
 #include <limits.h> /* for PATH_MAX */
 #include <chrono>
+#include <cerrno>
+#include <exception>
+#include <system_error>
+#if defined(__unix__) || defined(__APPLE__)
+#include <fcntl.h>
+#include <unistd.h>
+#define HAS_PREAD
+#endif
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
@@ -73,7 +81,9 @@ Data::Data() { // @suppress("Class members should be properly initialized")
 }
 
 Data::~Data() {
-  // TODO Auto-generated destructor stub
+#if defined(HAS_PREAD)
+  if(bgen_fd >= 0) ::close(bgen_fd);
+#endif
 }
 
 
@@ -2418,6 +2428,128 @@ void Data::set_nullreg_mat(){
 /////////////////////////////////////////////////
 /////////////////////////////////////////////////
 
+#if defined(HAS_PREAD)
+// positioned read of up to n bytes (fewer only at the end of the file), -1 on error
+static ssize_t pread_upto(int const& fd, uchar* buf, size_t const& n, uint64 const& offset){
+  size_t done = 0;
+  while(done < n){
+    ssize_t const r = ::pread(fd, buf + done, n - done, (off_t) (offset + done));
+    if(r < 0) {
+      if(errno == EINTR) continue;
+      return -1;
+    }
+    if(r == 0) break;
+    done += r;
+  }
+  return done;
+}
+
+// compressed genotype data of the BGEN (layout 2) variant record at 'offset': the same bytes and sizes as
+// readChunkFromBGEN, read with positioned reads so that every thread can read the variants it parses
+static void read_bgen_record(int const& fd, uint64 const& offset, vector<uchar>& data, uint32_t& insize, uint32_t& outsize, uint64& rec_size, string const& id){
+
+  // first read: a small window that holds the header fields (and the start of the data) of most records
+  size_t const window = 4096;
+  static thread_local vector<uchar> hdr(window);
+  ssize_t const r = pread_upto(fd, hdr.data(), window, offset);
+  if(r < 0) throw "failed to read genotype data block for variant: " + id;
+  size_t have = r, pos = 0;
+  // make sure bytes [0, pos + n) of the record are in hdr
+  auto need = [&](size_t const& n){
+    if(pos + n <= have) return;
+    if(hdr.size() < pos + n) hdr.resize(pos + n);
+    if(pread_upto(fd, hdr.data() + have, pos + n - have, offset + have) != (ssize_t) (pos + n - have))
+      throw "failed to read genotype data block for variant: " + id;
+    have = pos + n;
+  };
+
+  uint16_t len16 = 0;
+  uint32_t len32 = 0;
+  for(int k = 0; k < 3; k++){ // snpid, rsid, chromosome
+    need(2);
+    std::memcpy(&len16, &hdr[pos], 2);
+    pos += 2 + len16;
+  }
+  pos += 4 + 2; // position, number of alleles
+  for(int k = 0; k < 2; k++){ // alleles
+    need(4);
+    std::memcpy(&len32, &hdr[pos], 4);
+    pos += 4 + len32;
+  }
+  need(8);
+  std::memcpy(&insize, &hdr[pos], 4);
+  std::memcpy(&outsize, &hdr[pos + 4], 4);
+  pos += 8;
+  if(insize < 4) throw "failed to read genotype data block for variant: " + id;
+
+  // genotype data block: copy the part already read, then read the rest (data is reused, never shrunk)
+  size_t const n = insize - 4;
+  if(data.size() < n) data.resize(n);
+  size_t const got = (have > pos) ? std::min(have - pos, n) : 0;
+  if(got > 0) std::memcpy(data.data(), hdr.data() + pos, got);
+  if((n > got) && (pread_upto(fd, data.data() + got, n - got, offset + pos + got) != (ssize_t) (n - got)))
+    throw "failed to read genotype data block for variant: " + id;
+  rec_size = pos + n;
+}
+
+#if defined(POSIX_FADV_WILLNEED)
+// let the OS start reading the record of variant j in the background (at most len_cap bytes)
+static void prefetch_bgen_record(int const& fd, vector<snp> const& snpinfo, uint64 const& j, uint64 const& len_cap){
+  if(j >= snpinfo.size()) return;
+  uint64 const lo = snpinfo[j].offset;
+  uint64 len = len_cap;
+  // records are stored back to back, so the start of the next variant bounds the end of this one
+  if(((j + 1) < snpinfo.size()) && (snpinfo[j + 1].offset > lo))
+    len = std::min(len, snpinfo[j + 1].offset - lo);
+  posix_fadvise(fd, (off_t) lo, (off_t) len, POSIX_FADV_WILLNEED);
+}
+#endif
+#endif
+
+namespace {
+// writes the result lines of one block on a separate thread while the next block is computed:
+// every file receives the same strings in the same order as with direct writes
+struct block_writer {
+  Files* ofile;
+  vector< std::shared_ptr<Files> >* ofile_split;
+  vector< std::pair<int, string> > lines; // (-1: single result file, j: file of trait j; text)
+  std::thread th;
+  std::exception_ptr err;
+
+  block_writer(Files* f, vector< std::shared_ptr<Files> >* fs) : ofile(f), ofile_split(fs) {}
+  ~block_writer() { if(th.joinable()) th.join(); }
+
+  void write(){
+    try {
+      for(auto const& l : lines)
+        if(l.first < 0) (*ofile) << l.second;
+        else (*(*ofile_split)[l.first]) << l.second;
+    } catch (...) {
+      err = std::current_exception();
+    }
+  }
+  void wait(){
+    if(th.joinable()) th.join();
+    if(err) {
+      std::exception_ptr e = err;
+      err = nullptr;
+      std::rethrow_exception(e);
+    }
+  }
+  // hand over the lines of a block (block_lines gets back the already written ones)
+  void start(vector< std::pair<int, string> >& block_lines){
+    wait();
+    lines.swap(block_lines);
+    try {
+      th = std::thread(&block_writer::write, this);
+    } catch (std::system_error const&) { // no thread available: write the block now
+      write();
+      wait();
+    }
+  }
+};
+} // namespace
+
 void Data::test_snps_fast() {
 
   sout << "Association testing mode";
@@ -2453,6 +2585,32 @@ void Data::test_snps_fast() {
   vector< variant_block > block_info;
   initialize_thread_data(Gblock.thread_data, params);
 
+  // closed-form block statistics are kept for all blocks of a chromosome (reset below for each chromosome)
+  cf_cache = cf_block();
+  cf_cache_on = true;
+#if defined(HAS_PREAD)
+  // BGEN v1.2 8-bit: the threads parsing a block read their variants themselves (see compute_tests_mt);
+  // otherwise (or if the file cannot be opened as a regular file) readChunk reads the block beforehand
+  if((params.file_type == "bgen") && params.streamBGEN && !params.build_mask){
+    bgen_fd = ::open(files.bgen_file.c_str(), O_RDONLY);
+    struct stat st;
+    if((bgen_fd >= 0) && ((fstat(bgen_fd, &st) != 0) || !S_ISREG(st.st_mode))) {
+      ::close(bgen_fd);
+      bgen_fd = -1;
+    }
+  }
+#endif
+  // result lines are written by a separate thread while the next block is computed
+  // (with OMP_PROC_BIND it shares the CPU of OpenMP thread 0, whose share of the dynamic loops then shrinks)
+  bool const async_out = (params.threads > 1);
+  vector< std::pair<int, string> > out_lines;
+  block_writer out_writer(&ofile, &ofile_split);
+  auto write_line = [&](int const& k, string const& line){
+    if(async_out) out_lines.emplace_back(k, line);
+    else if(k < 0) ofile << line;
+    else (*ofile_split[k]) << line;
+  };
+
 
   for(auto const& chrom : files.chr_read) {
 
@@ -2484,6 +2642,8 @@ void Data::test_snps_fast() {
       // print y/x/logreg offset used for level 1 
       if(params.debug) write_inputs();
     }
+    // inputs of the closed-form block statistics (residuals, null model weights, pheno_pass) were just updated
+    cf_cache = cf_block();
 
     // analyze by blocks of SNPs
     for(int bb = 0; bb < chrom_nb ; bb++) {
@@ -2499,13 +2659,16 @@ void Data::test_snps_fast() {
 
       sout << " block [" << block + 1 << "/" << params.total_n_block << "] : " << flush;
       
-      allocate_mat(Gblock.Gmat, params.n_samples, bs);
+      // the closed-form path only uses the first bs columns: keep the largest allocation across blocks
+      if( !cf_supported(params) || (Gblock.Gmat.rows() != params.n_samples) || (Gblock.Gmat.cols() < bs) )
+        allocate_mat(Gblock.Gmat, params.n_samples, bs);
       block_info.resize(bs);
 
       // read SNP, impute missing & compute association test statistic
       analyze_block(chrom, bs, &snp_tally, block_info);
 
       // print the results
+      out_lines.clear();
       for (auto const& snp_data : block_info){
 
         if( snp_data.ignored ) {
@@ -2527,24 +2690,35 @@ void Data::test_snps_fast() {
 
           if( !params.pheno_pass(j) || snp_data.ignored_trait(j) ) {
             if(!params.split_by_pheno) // if using single file, print NAs for snp/trait sum stats
-              ofile << snp_data.sum_stats[j];
+              write_line(-1, snp_data.sum_stats[j]);
 
             continue;
           }
 
           if(params.split_by_pheno)
-            (*ofile_split[j]) << snp_data.sum_stats[j]; // add test info
+            write_line(j, snp_data.sum_stats[j]); // add test info
           else
-            ofile << snp_data.sum_stats[j]; // add test info
+            write_line(-1, snp_data.sum_stats[j]); // add test info
         }
 
       }
+      if(async_out) out_writer.start(out_lines);
 
       snp_tally.snp_count += bs;
       block++;
     }
 
   }
+
+  out_writer.wait();
+#if defined(HAS_PREAD)
+  if(bgen_fd >= 0) {
+    ::close(bgen_fd);
+    bgen_fd = -1;
+  }
+#endif
+  cf_cache_on = false;
+  cf_cache = cf_block();
 
   sout << print_summary(&ofile, out, ofile_split, out_split, n_corrected, snp_tally, files, firth_est, params);
 
@@ -2561,7 +2735,9 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
   vector<uint64> indices(n_snps);
   std::iota(indices.begin(), indices.end(), start);
 
-  readChunk(indices, chrom, snp_data_blocks, insize, outsize, all_snps_info);
+  // with bgen_fd open, each variant is read by the thread that parses it (see compute_tests_mt)
+  if(bgen_fd < 0)
+    readChunk(indices, chrom, snp_data_blocks, insize, outsize, all_snps_info);
 
   // analyze using openmp
   compute_tests_mt(chrom, indices, snp_data_blocks, insize, outsize, all_snps_info);
@@ -2570,7 +2746,7 @@ void Data::analyze_block(int const& chrom, int const& n_snps, tally* snp_tally, 
 
   auto t2 = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1);
-  sout << "done (" << duration.count() << "ms) "<< endl;
+  sout << "done (" << duration.count() << "ms) "<< "\n"; // flushed with the next block's progress line
 }
 
 
@@ -2670,9 +2846,59 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
   ArrayXb err_caught = ArrayXb::Constant(bs, false);
   bool const parse_here = !params.build_mask && (((params.file_type == "bgen") && params.streamBGEN) || params.file_type == "bed");
 
+  // BGEN block not read by readChunk (bgen_fd open, see analyze_block): the thread parsing a variant reads it
+  // (same bytes) and asks the OS to fetch the matching variant of the next block in the background
+#if defined(HAS_PREAD)
+  bool const read_here = parse_here && (bgen_fd >= 0);
+#if defined(POSIX_FADV_WILLNEED)
+  bool const next_block_known = (bs > 0) && (indices[bs - 1] == indices[0] + bs - 1); // consecutive variants
+#endif
+#endif
+  // read errors are kept per variant and thrown after the parallel loop (an exception cannot leave it)
+  vector<string> read_err;
+#if defined(HAS_PREAD)
+  if(read_here) read_err.resize(bs);
+#endif
+  auto check_read = [&](){
+    for(auto const& msg : read_err)
+      if(!msg.empty()) throw msg;
+  };
+  // returns false if the variant could not be read
+  auto parse_variant = [&](size_t const& isnp, variant_block* snp_block_info) -> bool {
+#if defined(HAS_PREAD)
+    if(read_here){
+      static thread_local vector<uchar> rec_data; // reused across variants and blocks
+      static thread_local uint64 rec_max = 0;
+      uint32_t isize = 0, osize = 0;
+      uint64 rec_size = 0;
+      try {
+        read_bgen_record(bgen_fd, snpinfo[indices[isnp]].offset, rec_data, isize, osize, rec_size, snpinfo[indices[isnp]].ID);
+      } catch (string const& msg) {
+        read_err[isnp] = msg;
+        return false;
+      } catch (...) {
+        read_err[isnp] = "failed to read genotype data block for variant: " + snpinfo[indices[isnp]].ID;
+        return false;
+      }
+      rec_max = std::max(rec_max, rec_size);
+#if defined(POSIX_FADV_WILLNEED)
+      if(next_block_known)
+        for(size_t k = isnp; k < std::max(bs, (size_t) params.block_size); k += bs)
+          prefetch_bgen_record(bgen_fd, snpinfo, indices[0] + bs + k, 2 * rec_max);
+#endif
+      parseSNP(isnp, chrom, &rec_data, isize, osize, &params, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, &snpinfo[indices[isnp]], &Gblock, snp_block_info, sout);
+      return true;
+    }
+#endif
+    parseSNP(isnp, chrom, &(snp_data_blocks[isnp]), insize[isnp], outsize[isnp], &params, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, &snpinfo[indices[isnp]], &Gblock, snp_block_info, sout);
+    return true;
+  };
+
   // closed-form score tests: read the whole block first, then get the inner products
   // needed by the tests of all its variants from one matrix product (see cf_block)
-  cf_block cf;
+  // in test_snps_fast, cf_cache keeps the known vectors of the chromosome (reset when its inputs change)
+  cf_block cf_local;
+  cf_block& cf = cf_cache_on ? cf_cache : cf_local;
   if( cf_supported(params) && (bs > 0) ){
     if( parse_here ){
 #if defined(_OPENMP)
@@ -2680,12 +2906,14 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
 #pragma omp parallel for schedule(dynamic)
 #endif
       for(size_t isnp = 0; isnp < bs; isnp++)
-        parseSNP(isnp, chrom, &(snp_data_blocks[isnp]), insize[isnp], outsize[isnp], &params, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, &snpinfo[indices[isnp]], &Gblock, &(all_snps_info[isnp]), sout);
+        parse_variant(isnp, &(all_snps_info[isnp]));
 #if defined(_OPENMP)
       setNbThreads(params.threads);
 #endif
+      check_read();
     }
-    cf_prepare(cf, res, in_filters.ind_in_analysis, params, pheno_data, m_ests);
+    if( !cf.active )
+      cf_prepare(cf, res, in_filters.ind_in_analysis, params, pheno_data, m_ests);
     cf.S.noalias() = cf.W.transpose() * Gblock.Gmat.leftCols(bs);
   }
 
@@ -2703,8 +2931,8 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
       #endif
 
       // to store variant information
-      if( parse_here && !cf.active )
-        parseSNP(isnp, chrom, &(snp_data_blocks[isnp]), insize[isnp], outsize[isnp], &params, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, &snpinfo[snp_index], &Gblock, block_info, sout);
+      if( parse_here && !cf.active && !parse_variant(isnp, block_info) )
+        continue; // read error, thrown below
 
       // to store variant information
       reset_thread(&(Gblock.thread_data[thread_num]), params);
@@ -2762,6 +2990,7 @@ void Data::compute_tests_mt(int const& chrom, vector<uint64> indices,vector< vec
 #endif
 
   // check no errors
+  check_read();
   if(err_caught.any())
     for(int i = 0; i < err_caught.size(); i++)
       if(err_caught(i)) throw all_snps_info[i].sum_stats[0];
