@@ -24,6 +24,8 @@
 
 */
 
+#include <atomic>
+#include <cstring>
 #include "Regenie.hpp"
 #include "Files.hpp"
 #include "Geno.hpp"
@@ -1189,6 +1191,15 @@ void fit_null_firth(bool const& silent, int const& chrom, struct f_ests* firth_e
   else // from null log. reg.
     get_beta_start_firth(firth_est, m_ests);
 
+  // quantities at SNP effect 0 for the approx Firth tests (set below with the offset; not needed when only
+  // writing the null estimates of all chromosomes beforehand)
+  bool set_null_ests = params->test_mode && params->firth && (params->trait_mode == 1) && !(params->write_null_firth && params->compute_all_chr);
+  firth_est->has_null_ests = ArrayXb::Constant(params->n_pheno, false);
+  if(set_null_ests){
+    firth_est->pivec_null.resize(params->n_pheno);
+    firth_est->dev_null.resize(params->n_pheno);
+  }
+
   // fit null firth (in parallel for MT mode)
 #if defined(_OPENMP)
   if((params->n_pheno>2) && !params->blup_cov) setNbThreads(1); // for < 3, mt in eigen should be similar
@@ -1207,6 +1218,15 @@ void fit_null_firth(bool const& silent, int const& chrom, struct f_ests* firth_e
     if(params->test_mode){
       firth_est->cov_blup_offset.col(i) = pheno_data->new_cov * bvec.head(pheno_data->new_cov.cols()).matrix(); // store offset used for approx firth
      if(!params->blup_cov) firth_est->cov_blup_offset.col(i) += m_ests->blups.col(i); // if offset  
+
+      if(set_null_ests){ // same calls as in fit_firth_logistic_snp_fast (aligned copy of the offset, full length)
+        ArrayXd offset = firth_est->cov_blup_offset.col(i).array();
+        MapArXd Y (pheno_data->phenotypes_raw.col(i).data(), pheno_data->phenotypes_raw.rows());
+        MapArXb mask (pheno_data->masked_indivs.col(i).data(), pheno_data->masked_indivs.rows());
+        get_pvec(firth_est->pivec_null[i], offset, params->numtol_eps);
+        firth_est->dev_null(i) = get_logist_dev(Y, firth_est->pivec_null[i], mask);
+        firth_est->has_null_ests(i) = true;
+      }
     }
 
     if(params->write_null_firth)
@@ -1358,7 +1378,6 @@ void fit_firth_logistic_snp_fast(int const& chrom, int const& ph, int const& isn
   double lrt, dev0 = 0;
 
   double bstart = 0, betaold, se;
-  ArrayXd offset;
 
   MapArXd Y (pheno_data->phenotypes_raw.col(ph).data(), pheno_data->phenotypes_raw.rows());
   MapArXb mask (pheno_data->masked_indivs.col(ph).data(), pheno_data->masked_indivs.rows());
@@ -1382,13 +1401,23 @@ void fit_firth_logistic_snp_fast(int const& chrom, int const& ph, int const& isn
     bstart = log( (block_info->genocounts(1,ph) + 0.5) * (block_info->genocounts(3,ph) + 0.5) / (block_info->genocounts(0,ph) + 0.5) / (block_info->genocounts(4,ph) + 0.5) );
   betaold = bstart;
 
-  // covariate effects added as offset in firth approx.
-  offset = fest->cov_blup_offset.col(ph).array(); 
+  // covariate effects added as offset in firth approx. (only used elementwise and in subsets below, so no copy)
+  MapcArXd offset (fest->cov_blup_offset.col(ph).data(), fest->cov_blup_offset.rows());
+  // p and deviance at SNP effect 0 (offset only) were computed in fit_null_firth for this chromosome
+  bool has_null_ests = (fest->has_null_ests.size() > ph) && fest->has_null_ests(ph);
+  struct firth_snp_ests f0;
 
   // get dev0
   ArrayXd pivec, wvec, Gvec_mask;
-  get_pvec(pivec, offset, params->numtol_eps);
-  dev0 = get_logist_dev(Y, pivec, mask);
+  if(has_null_ests) {
+    dev0 = fest->dev_null(ph);
+    // local copy, so that the code below is the same as without the cache (-ffast-math may reassociate the
+    // sum differently when it reads other arrays)
+    if(index_carriers.size() == 0) pivec = fest->pivec_null[ph];
+  } else {
+    get_pvec(pivec, ArrayXd(offset), params->numtol_eps);
+    dev0 = get_logist_dev(Y, pivec, mask);
+  }
   if((index_carriers.size() > 0)) { // bug fix to use the right deviance fn if using approximate penalty based on carrier status
     get_pvec(pivec, offset(index_carriers), params->numtol_eps);
     get_wvec(pivec, wvec, mask(index_carriers));
@@ -1399,26 +1428,31 @@ void fit_firth_logistic_snp_fast(int const& chrom, int const& ph, int const& isn
   }
   dev0 -= log( (Gvec_mask.square() * wvec).sum() );
 
+  if(has_null_ests) {
+    f0.pivec = &fest->pivec_null[ph];
+    f0.dev = fest->dev_null(ph);
+  }
+
   // fit state =
   //  0 - fit was successful
   //  1 - too slow convergence
   //  2 - diff_beta increased
   //  3 - fitted p = 0
   //  4 - lrt < 0
-  fit_state = fit_firth_pseudo(dev0, Y, Gvec, offset, mask, index_carriers, betaold, se, lrt, maxstep, niter_pseudo, tol, params); // try pseudo
+  fit_state = fit_firth_pseudo(dev0, Y, Gvec, offset, mask, index_carriers, betaold, se, lrt, maxstep, niter_pseudo, tol, params, &f0); // try pseudo
 
   // If didn't converge, try again with NR at 0
   if(fit_state && (bstart != 0) && index_carriers.size()) {
     if(params->debug) cerr << "WARNING: Pseudo-firth did not converge (" << fit_state << "; LRT = " << lrt << "; dev0 = " << dev0 << ") !\n";
     betaold = 0;
-    fit_state = !fit_firth(dev0, Y, Gvec, offset, mask, index_carriers, betaold, se, lrt, maxstep, 100, tol, params); // try NR (slower)
+    fit_state = !fit_firth(dev0, Y, Gvec, offset, mask, index_carriers, betaold, se, lrt, maxstep, 100, tol, params, &f0); // try NR (slower)
   }
 
   // If didn't converge, try with NR
   if(fit_state){
     if(params->debug) cerr << "WARNING: NR-firth did not converge (" << fit_state << "; LRT = " << lrt << ") !\n";
     betaold = bstart; 
-    fit_state = !fit_firth(dev0, Y, Gvec, offset, mask, index_carriers, betaold, se, lrt, maxstep, niter_nr, tol, params); // try NR (slower)
+    fit_state = !fit_firth(dev0, Y, Gvec, offset, mask, index_carriers, betaold, se, lrt, maxstep, niter_nr, tol, params, &f0); // try NR (slower)
   }
 
   if(fit_state){
@@ -1717,9 +1751,11 @@ bool fit_firth_pseudo(double& dev0, const Ref<const ArrayXd>& Y1, const Ref<cons
 }
 
 // for approx firth testing step
-uint fit_firth_pseudo(double const& dev0, const Ref<const ArrayXd>& Y1, const Ref<const VectorXd>& Gvec, const Ref<const ArrayXd>& offset, const Ref<const ArrayXb>& mask, const Ref<const ArrayXi>& index_carriers, double& betavec, double& sevec, double& lrt, int const& maxstep_firth, int const& niter_firth, double const& tol, struct param const* params) {
+uint fit_firth_pseudo(double const& dev0, const Ref<const ArrayXd>& Y1, const Ref<const VectorXd>& Gvec, const Ref<const ArrayXd>& offset, const Ref<const ArrayXb>& mask, const Ref<const ArrayXi>& index_carriers, double& betavec, double& sevec, double& lrt, int const& maxstep_firth, int const& niter_firth, double const& tol, struct param const* params, struct firth_snp_ests const* f0) {
 
   bool fastFirth = index_carriers.size() > 0;
+  // at betavec = 0, eta = offset + Gvec*0 = offset, so p and the deviance are those at SNP effect 0
+  bool use_null_ests = (f0 != nullptr) && (f0->pivec != nullptr) && (betavec == 0);
   int niter_cur = 0, niter_log = 0, niter_max = 25;
   double dev_new=0, dev_non_carriers = 0, mx, maxstep = 5;
   double bdiff=1e16, bdiff_new=1e16;
@@ -1729,9 +1765,14 @@ uint fit_firth_pseudo(double const& dev0, const Ref<const ArrayXd>& Y1, const Re
   ArrayXd hvec, ystar, etavec, pivec, wvec, XtWX_diag, Gvec_mask, Gvec_sq;
 
   if(fastFirth) {
-    get_pvec(etavec, pivec, betavec, offset, Gvec, params->numtol_eps);
-    dev_new = get_logist_dev(Y1, pivec, mask);
-    dev_non_carriers = dev_new - get_logist_dev(Y1(index_carriers), pivec(index_carriers), mask(index_carriers));
+    if(use_null_ests) {
+      dev_new = f0->dev;
+      dev_non_carriers = dev_new - get_logist_dev(Y1(index_carriers), (*f0->pivec)(index_carriers), mask(index_carriers));
+    } else {
+      get_pvec(etavec, pivec, betavec, offset, Gvec, params->numtol_eps);
+      dev_new = get_logist_dev(Y1, pivec, mask);
+      dev_non_carriers = dev_new - get_logist_dev(Y1(index_carriers), pivec(index_carriers), mask(index_carriers));
+    }
     Gvec_mask = Gvec(index_carriers);
   } else Gvec_mask = mask.select(Gvec.array(),0);
   Gvec_sq = Gvec_mask.square();
@@ -1741,19 +1782,20 @@ uint fit_firth_pseudo(double const& dev0, const Ref<const ArrayXd>& Y1, const Re
   while(niter_cur++ < niter_firth){
 
     // update quantities
+    // (from the second iteration on, pivec is already at betavec: the inner loop below always
+    // ends with get_pvec at betanew, before its only break, then betavec = betanew)
     if(fastFirth) {
-      get_pvec(etavec, pivec, betavec, offset(index_carriers), Gvec(index_carriers), params->numtol_eps);
-      dev_new = dev_non_carriers + get_logist_dev(Y1(index_carriers), pivec, mask(index_carriers));
+      if(niter_cur == 1) get_pvec(etavec, pivec, betavec, offset(index_carriers), Gvec(index_carriers), params->numtol_eps);
       get_wvec(pivec, wvec, mask(index_carriers));
     } else {
-      get_pvec(etavec, pivec, betavec, offset, Gvec, params->numtol_eps);
-      dev_new = get_logist_dev(Y1, pivec, mask);
+      if(niter_cur == 1) {
+        if(use_null_ests) pivec = *f0->pivec;
+        else get_pvec(etavec, pivec, betavec, offset, Gvec, params->numtol_eps);
+      }
       get_wvec(pivec, wvec, mask);
     }
     XtWX_diag = Gvec_sq * wvec;
     XtWX = XtWX_diag.sum();
-    // compute deviance
-    dev_new -= log(XtWX);
 
     // compute diag(H), H = U(U'U)^{-1}U', U = Gamma^(1/2)X
     hvec = XtWX_diag / XtWX;
@@ -1765,6 +1807,10 @@ uint fit_firth_pseudo(double const& dev0, const Ref<const ArrayXd>& Y1, const Re
     // stopping criterion using modified score function
     // edit 5.31.12 for edge cases with approx Firth
     if( (fabs(score) < tol) && (niter_cur >= 2) ) {
+      // the deviance is only used at convergence (same pivec and XtWX as above)
+      if(fastFirth) dev_new = dev_non_carriers + get_logist_dev(Y1(index_carriers), pivec, mask(index_carriers));
+      else dev_new = get_logist_dev(Y1, pivec, mask);
+      dev_new -= log(XtWX);
       if(params->debug) cerr << "stopping criterion met (|" << score << "| < " << tol << ")\n";
       break;
     }
@@ -1834,7 +1880,7 @@ uint fit_firth_pseudo(double const& dev0, const Ref<const ArrayXd>& Y1, const Re
 }
 
 // for approx firth testing step (using NR)
-bool fit_firth(double const& dev0, const Ref<const ArrayXd>& Y1, const Ref<const VectorXd>& X1, const Ref<const ArrayXd>& offset, const Ref<const ArrayXb>& mask, const Ref<const ArrayXi>& index_carriers, double& betavec, double& sevec, double& lrt, int const& maxstep_firth, int const& niter_firth, double const& tol, struct param const* params) {
+bool fit_firth(double const& dev0, const Ref<const ArrayXd>& Y1, const Ref<const VectorXd>& X1, const Ref<const ArrayXd>& offset, const Ref<const ArrayXb>& mask, const Ref<const ArrayXi>& index_carriers, double& betavec, double& sevec, double& lrt, int const& maxstep_firth, int const& niter_firth, double const& tol, struct param const* params, struct firth_snp_ests const* f0) {
 
   bool fastFirth = index_carriers.size() > 0;
   int niter_cur = 0, niter_search;
@@ -1844,8 +1890,13 @@ bool fit_firth(double const& dev0, const Ref<const ArrayXd>& Y1, const Ref<const
   double score, betanew = 0, step_size, XtWX = 0;
   ArrayXd hvec, etavec, pivec, wvec, XtWX_diag, Gvec_mask, Gvec_sq;
  
-  get_pvec(etavec, pivec, betavec, offset, X1, params->numtol_eps);
-  dev_old = get_logist_dev(Y1, pivec, mask);
+  if((f0 != nullptr) && (f0->pivec != nullptr) && (betavec == 0)) { // eta = offset + X1*0 = offset
+    dev_old = f0->dev;
+    if(!fastFirth) pivec = *f0->pivec;
+  } else {
+    get_pvec(etavec, pivec, betavec, offset, X1, params->numtol_eps);
+    dev_old = get_logist_dev(Y1, pivec, mask);
+  }
   if(fastFirth) {
     get_pvec(etavec, pivec, betavec, offset(index_carriers), X1(index_carriers), params->numtol_eps);
     dev_non_carriers = dev_old - get_logist_dev(Y1(index_carriers), pivec, mask(index_carriers));
@@ -2335,31 +2386,139 @@ void run_SPA_test_snp(double& chisq, double& pv, const double& stats, const doub
 
 
 
+// K'(t) and K''(t) in one pass over the samples (both use exp(-t/c*Gmod)).
+// Each term repeats the operations that GCC 9 emits for compute_K1_snp/compute_K2_snp (and the fast versions)
+// with -O3 -ffast-math for generic x86-64 (operands reordered, 1/c^2 hoisted out of the K'' loop, and the first
+// element of the Eigen sum in compute_K2_snp evaluated separately). These functions are compiled without
+// -ffast-math and without contraction so that this order is kept exactly. Other compilers or flags (FMA, AVX,
+// no -ffast-math) can compile the original functions differently, so they keep using them.
+#if defined(__GNUC__) && (__GNUC__ == 9) && !defined(__clang__) && !defined(__INTEL_COMPILER) && defined(__x86_64__) && defined(__FAST_MATH__) && !defined(__FMA__) && !defined(__AVX__)
+#define SPA_FUSED_K12
+#pragma GCC push_options
+#pragma GCC optimize ("no-fast-math", "fp-contract=off")
+static void compute_K12_dense(double const t, double const a, double const c, const double* Gmod, const double* phat, const double* Gamma_sqrt, const bool* mask, Index const n, double& K1, double& K2){
+
+  bool above_lim = false;
+  double s = -t / c, cc = c * c, inv_cc = 1 / cc, k1 = 0, k2 = 0, v, e, d, gg, term1;
+
+  for(Index i = 0; i < n; i++){
+    if(!mask[i]) continue;
+    v = s * Gmod[i];
+    if(v > MAX_EXP_LIM) above_lim = true; // compute_K2_snp returns 0
+    e = exp(v);
+    d = (1 - phat[i]) * e + phat[i];
+    gg = Gamma_sqrt[i] * Gmod[i];
+    gg = gg * gg;
+    term1 = (Gmod[i] * phat[i]) / (d * c);
+    if(i == 0) { // first coefficient of the Eigen sums
+      k1 = term1;
+      k2 = ((gg / cc) * e) / (d * d);
+    } else {
+      k1 += term1;
+      k2 += (gg * (e * inv_cc)) / (d * d);
+    }
+  }
+
+  K1 = k1 - a / c;
+  K2 = above_lim ? 0 : k2;
+}
+
+static void compute_K12_sparse(double const t, double const b, double const c, double const dval, double const denum, SpVec const& Gsparse, const double* Gmod, const double* phat, const double* Gamma_sqrt, const bool* mask, Index const n, double& K1, double& K2){
+
+  bool above_lim = false;
+  double s = -t / c, k1 = 0, k2 = 0, v, e, d, gg, cd;
+
+  for (SpVec::InnerIterator it(Gsparse); it; ++it) {
+    Index j = it.index();
+    eigen_assert((j >= 0) && (j < n));
+    if(!mask[j]) continue;
+    v = s * Gmod[j];
+    if(v > MAX_EXP_LIM) above_lim = true; // compute_K2_fast_snp returns 0
+    e = exp(v);
+    d = (1 - phat[j]) * e + phat[j];
+    k1 += (Gmod[j] * phat[j]) / (d * c);
+    gg = Gmod[j] * Gamma_sqrt[j];
+    gg = gg * gg;
+    cd = c * d;
+    k2 += (gg * e) / (cd * cd);
+  }
+
+  K1 = ((t / denum) * b + (-dval) / c) + k1;
+  K2 = above_lim ? 0 : (b / denum + k2);
+}
+#pragma GCC pop_options
+
+// the fused kernels are also compared bitwise with the original functions on their first calls (per kernel);
+// after any difference, the original functions are used for the rest of the run
+static std::atomic<int> spa_fused_checks_dense(64), spa_fused_checks_sparse(64);
+static std::atomic<bool> spa_fused_off(false);
+#endif
+
+// K'(t) and K''(t) at the same t
+static void compute_K12_snp(double const& t, double const& denum, SpVec const& Gsparse, const Ref<const ArrayXd>& phat, const Ref<const ArrayXd>& Gamma_sqrt, struct spa_data const& spa_df, const Ref<const ArrayXb>& mask, double& K1, double& K2){
+#if defined(SPA_FUSED_K12)
+  Index const n = spa_df.Gmod.size();
+  eigen_assert((phat.size() == n) && (Gamma_sqrt.size() == n) && (mask.size() == n));
+  std::atomic<int>& checks_left = spa_df.fastSPA ? spa_fused_checks_sparse : spa_fused_checks_dense;
+  bool const use_fused = !spa_fused_off.load(std::memory_order_relaxed);
+  double K1_fused = 0, K2_fused = 0;
+  if(use_fused){
+    if(spa_df.fastSPA) compute_K12_sparse(t, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod.data(), phat.data(), Gamma_sqrt.data(), mask.data(), n, K1_fused, K2_fused);
+    else compute_K12_dense(t, spa_df.val_a, spa_df.val_c, spa_df.Gmod.data(), phat.data(), Gamma_sqrt.data(), mask.data(), n, K1_fused, K2_fused);
+    if(checks_left.load(std::memory_order_relaxed) <= 0) {
+      K1 = K1_fused; K2 = K2_fused;
+      return;
+    }
+  }
+#endif
+  K1 = spa_df.fastSPA ? compute_K1_fast_snp(t, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, mask) : compute_K1_snp(t, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, mask);
+  K2 = spa_df.fastSPA ? compute_K2_fast_snp(t, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, Gamma_sqrt, mask) : compute_K2_snp(t, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, Gamma_sqrt, mask);
+#if defined(SPA_FUSED_K12)
+  if(use_fused){
+    if((std::memcmp(&K1, &K1_fused, sizeof(double)) != 0) || (std::memcmp(&K2, &K2_fused, sizeof(double)) != 0))
+      spa_fused_off = true;
+    else checks_left--;
+  }
+#endif
+}
+
 // SPA (MT in OpenMP)
 double solve_K1_snp(const double& tval, const double& denum, SpVec const& Gsparse, const Ref<const ArrayXd>& phat, const Ref<const ArrayXd>& Gamma_sqrt, struct spa_data& spa_df, const Ref<const ArrayXb>& mask, double const& tol, int const& niter_max, double const& missing_value_double){
 
   int niter_cur;
   int lambda = spa_df.pos_score ? 1 : -1; // if score is negative, adjust K' and K''
-  double min_x, max_x, t_old, f_old, t_new = -1, f_new, hess;
+  double min_x, max_x, t_old, f_old, t_new = -1, f_new, hess, K1_new, K2_new;
 
+  // K' and K'' are computed together at each new t, so K''(t_old) of the next step and K''(root) are known
+  spa_df.has_K2_root = false;
   niter_cur = 0;
   if(tval >=0){min_x = 0, max_x = std::numeric_limits<double>::max();}
   else{min_x = std::numeric_limits<double>::lowest(), max_x = 0;}
   t_old = 0;
-  f_old = spa_df.fastSPA ? compute_K1_fast_snp(lambda * t_old, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, mask) : compute_K1_snp(lambda * t_old, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, mask);
+  if(!spa_df.has_K12_zero){ // same values at lambda * 0 = +-0 for both tails
+    compute_K12_snp(lambda * t_old, denum, Gsparse, phat, Gamma_sqrt, spa_df, mask, spa_df.K1_zero, spa_df.K2_zero);
+    spa_df.has_K12_zero = true;
+  }
+  f_old = spa_df.K1_zero;
   f_old *= lambda;
   f_old -= tval; 
+  hess = spa_df.K2_zero;
 
   while( niter_cur++ < niter_max ){
 
-    hess = spa_df.fastSPA ? compute_K2_fast_snp(lambda * t_old, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, Gamma_sqrt, mask) : compute_K2_snp(lambda * t_old, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, Gamma_sqrt, mask);
     if(hess == 0) return missing_value_double;
     t_new = t_old - f_old / hess;
-    f_new = spa_df.fastSPA ? compute_K1_fast_snp(lambda * t_new, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, mask) : compute_K1_snp(lambda * t_new, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, mask);
+    compute_K12_snp(lambda * t_new, denum, Gsparse, phat, Gamma_sqrt, spa_df, mask, K1_new, K2_new);
+    f_new = K1_new;
     f_new *= lambda;
     f_new -= tval;
 
-    if( fabs( f_new ) < tol ) break;
+    if( fabs( f_new ) < tol ) {
+      spa_df.has_K2_root = true;
+      spa_df.root_K2 = t_new;
+      spa_df.K2_root = K2_new;
+      break;
+    }
 
     // update bounds on root
     if( t_new && (t_new > min_x) && (t_new < max_x) ){
@@ -2368,7 +2527,8 @@ double solve_K1_snp(const double& tval, const double& denum, SpVec const& Gspars
     } else{ // bisection method if t_new went out of bounds and re-compute f_new
       t_new = ( min_x + max_x ) / 2;
       // if( fabs( min_x - t_new ) < params->tol_spa ) break;
-      f_new = spa_df.fastSPA ? compute_K1_fast_snp(lambda * t_new, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, mask) : compute_K1_snp(lambda * t_new, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, mask);
+      compute_K12_snp(lambda * t_new, denum, Gsparse, phat, Gamma_sqrt, spa_df, mask, K1_new, K2_new);
+      f_new = K1_new;
       f_new *= lambda;
       f_new -= tval;
       // reduce bounds based on new value
@@ -2378,6 +2538,7 @@ double solve_K1_snp(const double& tval, const double& denum, SpVec const& Gspars
 
     t_old = t_new;
     f_old = f_new;
+    hess = K2_new; // K''(t_old)
   }
 
   // If didn't converge
@@ -2471,7 +2632,8 @@ void get_SPA_pvalue_snp(const double& root, const double& tval, double& pv, bool
   normal nd(0,1);
 
   kval = spa_df.fastSPA ? compute_K_fast_snp(lambda * root, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, mask) : compute_K_snp(lambda * root, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, mask);
-  k2val = spa_df.fastSPA ? compute_K2_fast_snp(lambda * root, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, Gamma_sqrt, mask) : compute_K2_snp(lambda * root, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, Gamma_sqrt, mask);
+  if(spa_df.has_K2_root && (spa_df.root_K2 == root)) k2val = spa_df.K2_root; // computed with K'(root) in solve_K1_snp
+  else k2val = spa_df.fastSPA ? compute_K2_fast_snp(lambda * root, spa_df.val_b, spa_df.val_c, spa_df.val_d, denum, Gsparse, spa_df.Gmod, phat, Gamma_sqrt, mask) : compute_K2_snp(lambda * root, spa_df.val_a, spa_df.val_c, spa_df.Gmod, phat, Gamma_sqrt, mask);
   if(k2val == 0) {
     test_fail = true;
     return;

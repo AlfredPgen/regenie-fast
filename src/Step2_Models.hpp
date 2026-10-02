@@ -33,10 +33,21 @@ struct f_ests {
 
   Eigen::MatrixXd cov_blup_offset;
   Eigen::MatrixXd beta_null_firth;
+  // approx Firth for binary traits: p and deviance at SNP effect 0 for each trait (N doubles per trait); they only
+  // depend on cov_blup_offset, so they are set with it in fit_null_firth (per chromosome) and reused by every corrected variant
+  std::vector<Eigen::ArrayXd> pivec_null;
+  Eigen::ArrayXd dev_null;
+  ArrayXb has_null_ests;
   std::vector<std::shared_ptr<Files>> firth_est_files;
   double deviance_logistic;
   double bhat_firth, se_b_firth;
   
+};
+
+// optional inputs of the single-SNP approx Firth fits (null pointers: computed as usual)
+struct firth_snp_ests {
+  const Eigen::ArrayXd* pivec = nullptr; // p at SNP effect 0 (f_ests::pivec_null)
+  double dev = 0; // deviance at SNP effect 0 (f_ests::dev_null)
 };
 
 struct spa_data {
@@ -44,6 +55,12 @@ struct spa_data {
   Eigen::ArrayXd Gmod;
   double val_a, val_b, val_c, val_d;
   bool pos_score, fastSPA;
+  // K'(0) and K''(0) are the same for both tails (exp(+-0) = 1), so the second tail reuses them
+  bool has_K12_zero = false;
+  double K1_zero, K2_zero;
+  // K''(root) from the last step of solve_K1_snp, reused for the p-value
+  bool has_K2_root = false;
+  double root_K2, K2_root;
 
 };
 
@@ -110,8 +127,8 @@ void fit_firth_logistic_snp_fast(int const&,int const&,int const&,bool const&,st
 bool fit_firth(int const&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::MatrixXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&,Eigen::ArrayXd&,Eigen::ArrayXd&,Eigen::ArrayXd&,Eigen::ArrayXd&,int const&,double&,bool const&,double&,int const&,int const&,double const&,struct param const*,bool const& check_score_inc = true);
 bool fit_firth_nr(double&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::MatrixXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&,Eigen::ArrayXd&,Eigen::ArrayXd&,Eigen::ArrayXd&,Eigen::ArrayXd&,int const&,double&,bool const&,double&,int const&,int const&,double const&,struct param const*,bool const& check_score_inc = true);
 bool fit_firth_pseudo(double&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::MatrixXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&,Eigen::ArrayXd&,Eigen::ArrayXd&,Eigen::ArrayXd&,Eigen::ArrayXd&,int const&,double&,bool const&,double&,int const&,int const&,double const&,struct param const*, bool const& apply_early_checks = true);
-uint fit_firth_pseudo(double const&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::VectorXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&,const Eigen::Ref<const Eigen::ArrayXi>&,double&,double&,double&,int const&,int const&,double const&,struct param const*);
-bool fit_firth(double const&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::VectorXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&,const Eigen::Ref<const Eigen::ArrayXi>&,double&,double&,double&,int const&,int const&,double const&,struct param const*);
+uint fit_firth_pseudo(double const&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::VectorXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&,const Eigen::Ref<const Eigen::ArrayXi>&,double&,double&,double&,int const&,int const&,double const&,struct param const*,struct firth_snp_ests const* f0 = nullptr);
+bool fit_firth(double const&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::VectorXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&,const Eigen::Ref<const Eigen::ArrayXi>&,double&,double&,double&,int const&,int const&,double const&,struct param const*,struct firth_snp_ests const* f0 = nullptr);
 bool fit_firth_adam(int const&,double&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const Eigen::MatrixXd>&,const Eigen::Ref<const Eigen::ArrayXd>&,const Eigen::Ref<const ArrayXb>&,Eigen::ArrayXd&,Eigen::ArrayXd&,Eigen::ArrayXd&,Eigen::ArrayXd&,int const&,double&,bool const&,double&,struct param const*);
 std::string get_firth_est_allChr(struct in_files&,struct filter const& ,struct ests&,struct f_ests&,struct phenodt&,struct param&,mstream&);
 std::string print_null_firth_info(struct in_files const&,struct f_ests&,struct param const&);
