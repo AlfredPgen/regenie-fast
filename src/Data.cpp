@@ -649,7 +649,8 @@ void Data::level_0_calculations() {
 
       get_block_size(params.block_size, chrom_nsnps, bb, bs);
 
-      Gblock.Gmat = MatrixXd::Zero(bs, params.n_samples);
+      if(params.file_type == "bed") Gblock.Gmat.resize(bs, params.n_samples); // the bed reader writes every entry
+      else Gblock.Gmat = MatrixXd::Zero(bs, params.n_samples);
       if(params.alpha_prior != -1) Gblock.snp_afs = MatrixXd::Zero(bs, 1);
 
       get_G(block, bs, chrom, in_filters.step1_snp_count, snpinfo, &params, &files, &Gblock, &in_filters, pheno_data.masked_indivs, pheno_data.phenotypes_raw, sout);
@@ -745,7 +746,9 @@ void Data::calc_cv_matrices(struct ridgel0* l0) {
       else
         l0->GtY[i] = Gmat * pheno_data.phenotypes.middleRows(cum_size_folds, params.cv_sizes(i));
       l0->GTY += l0->GtY[i];
-      l0->G_folds[i] = Gmat * Gmat.transpose();
+      l0->G_folds[i].setZero(bs,bs);
+      l0->G_folds[i].selfadjointView<Lower>().rankUpdate(Gmat); // symmetric product: half the flops of Gmat * Gmat^t
+      l0->G_folds[i].triangularView<Eigen::Upper>() = l0->G_folds[i].transpose(); // fill upper-triangular part
       l0->GGt += l0->G_folds[i];
       cum_size_folds += params.cv_sizes(i);
     }

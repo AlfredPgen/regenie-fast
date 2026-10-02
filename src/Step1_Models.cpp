@@ -486,16 +486,33 @@ void ridge_level_0(const int& block, struct in_files* files, struct param* param
     masked_in_folds[i] = pheno_data->masked_indivs.block(cum_size_folds, 0, params->cv_sizes(i), pheno_data->masked_indivs.cols());
 
     ww1 = l0->GGt - l0->G_folds[i];
-    SelfAdjointEigenSolver<MatrixXd> eig(ww1);
-    vmat = eig.eigenvectors();
-    dvec = eig.eigenvalues();
-    //if(i == 0)sout << ww1 << endl;
-    ww2 = vmat.transpose() * (l0->GTY - l0->GtY[i]);
+    // with few ridge parameters, one Cholesky solve per parameter (~bs^3/3 flops each)
+    // is much cheaper than a full eigendecomposition (~9 bs^3 flops)
+    bool use_chol = params->n_ridge_l0 <= 20;
+    VectorXd diag_ww1;
+    if(use_chol) {
+      diag_ww1 = ww1.diagonal();
+      ww2 = l0->GTY - l0->GtY[i];
+    } else {
+      SelfAdjointEigenSolver<MatrixXd> eig(ww1);
+      vmat = eig.eigenvectors();
+      dvec = eig.eigenvalues();
+      //if(i == 0)sout << ww1 << endl;
+      ww2 = vmat.transpose() * (l0->GTY - l0->GtY[i]);
+    }
 
     for(int j = 0; j < params->n_ridge_l0; ++j ) {
 
-      // b = U (D+sI)^(-1) U^t GtY
-      beta = vmat * (dvec.array() + params->lambda(j)).inverse().matrix().asDiagonal() * ww2;
+      if(use_chol) {
+        // b = (G^tG + sI)^(-1) GtY
+        ww1.diagonal() = diag_ww1.array() + params->lambda(j);
+        LLT<MatrixXd> llt(ww1);
+        if(llt.info() != Eigen::Success)
+          throw "Cholesky factorization failed in level 0 ridge (block " + to_string(block + 1) + ")";
+        beta = llt.solve(ww2);
+      } else
+        // b = U (D+sI)^(-1) U^t GtY
+        beta = vmat * (dvec.array() + params->lambda(j)).inverse().matrix().asDiagonal() * ww2;
 
       // save beta for each phenotype (only when using out-of-sample pred)
       if(!params->within_sample_l0 && params->print_block_betas)

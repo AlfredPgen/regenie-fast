@@ -1717,48 +1717,71 @@ void readChunkFromBedFileToG(const int& bs, const int& chrom, const uint32_t& sn
     files->geno_ifstream.read( reinterpret_cast<char *> (&files->bed_data_blocks[j][0]), files->bed_block_size);
   }
 
+  // Gmat is stored variant x sample, so the values of consecutive variants for one sample share a cache line:
+  // each task decodes 8 consecutive variants and then writes them sample by sample (same values as before)
+  int const ngroup = 8;
 #if defined(_OPENMP)
   setNbThreads(1);
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(static)
 #endif
-  for(int j = 0; j < bs; j++) {
+  for(int j0 = 0; j0 < bs; j0 += ngroup) {
 
-    int hc, ns;
-    uint32_t i, index ;
-    double total;
-    ArrayXd geno4; // genotype values for 4 samples at a time
+    int const nj = std::min(ngroup, bs - j0);
+    uint32_t const nsamp = params->n_samples;
+    static thread_local vector<int8_t> codes;
+    if(codes.size() < (size_t) ngroup * nsamp) codes.resize((size_t) ngroup * nsamp);
+    double mean_j[ngroup];
 
-    ns = 0, total = 0, i = 0, index = 0;
+    for(int k = 0; k < nj; k++) {
 
-    for (size_t byte_start = 0; byte_start < files->bed_block_size; byte_start++) {
+      int const j = j0 + k;
+      int hc, ns;
+      uint32_t i, index ;
+      double total;
+      int8_t* code = &codes[(size_t) k * nsamp];
 
-      geno4 = params->bed_lookup_table[ files->bed_data_blocks[j][byte_start] ];
+      ns = 0, total = 0, i = 0, index = 0;
 
-      for(int bit_start = 0; bit_start < 4; bit_start++, i++){
+      for (size_t byte_start = 0; byte_start < files->bed_block_size; byte_start++) {
 
-        // skip remainder past N samples
-        if(i >= nmax) break;
+        uchar const byte = files->bed_data_blocks[j][byte_start];
 
-        // skip samples that were ignored from the analysis
-        if( filters->ind_ignore(i) ) continue;
+        for(int bit_start = 0; bit_start < 4; bit_start++, i++){
 
-        hc = geno4(bit_start);
-        if(params->ref_first && (hc != -3)) hc = 2 - hc;
-        gblock->Gmat(j, index) = hc;
+          // skip remainder past N samples
+          if(i >= nmax) break;
 
-        if( filters->ind_in_analysis(index) && (hc != -3) ){
-          total += hc;
-          ns++;
+          // skip samples that were ignored from the analysis
+          if( filters->ind_ignore(i) ) continue;
+
+          hc = params->bed_lookup_table[byte](bit_start);
+          if(params->ref_first && (hc != -3)) hc = 2 - hc;
+          code[index] = hc;
+
+          if( filters->ind_in_analysis(index) && (hc != -3) ){
+            total += hc;
+            ns++;
+          }
+          index++;
         }
-        index++;
+      }
+      total /= ns;
+      mean_j[k] = total;
+      if(params->alpha_prior != -1) gblock->snp_afs(j, 0) = total / 2;
+    }
+
+    // write genotypes and impute missing (as mean_impute_g)
+    for (uint32_t index = 0; index < nsamp; index++) {
+      double* out = &(gblock->Gmat(j0, index));
+      if( !filters->ind_in_analysis(index) ) {
+        for(int k = 0; k < nj; k++) out[k] = 0;
+        continue;
+      }
+      for(int k = 0; k < nj; k++) {
+        int8_t const hc = codes[(size_t) k * nsamp + index];
+        out[k] = (hc == -3) ? mean_j[k] : hc;
       }
     }
-    total /= ns;
-    if(params->alpha_prior != -1) gblock->snp_afs(j, 0) = total / 2;
-
-    // impute missing
-    for (size_t i = 0; i < params->n_samples; i++) 
-      mean_impute_g(gblock->Gmat(j, i), total, filters->ind_in_analysis(i));
 
   }
 
