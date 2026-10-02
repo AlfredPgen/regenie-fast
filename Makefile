@@ -149,12 +149,17 @@ all: ${EFILE}
 ${EFILE}: libMvtnorm libqf libquad pgenlib remeta ${OBJECTS}
 	${CXX} ${CXXFLAGS} ${RGFLAGS} ${CFLAGS} -o ${EFILE} ${OBJECTS} ./external_libs/mvtnorm/libMvtnorm.a ./external_libs/qf/qf.a ./external_libs/quadpack/libquad.a ./external_libs/pgenlib/pgenlib.a ./external_libs/remeta/remeta.a ${LPATHS} ${LIBS}
 
+# header dependencies (.d files), so that a change to a struct in a header rebuilds every object using it
+DEPFLAGS      = -MMD -MP
+
 # fast BGEN parsing must reproduce the per-sample arithmetic exactly: plain IEEE operations, no contraction
 ./src/bgen8_parse.o: ./src/bgen8_parse.cpp
-	${CXX} ${CXXFLAGS} ${RGFLAGS} -o $@ -c $< ${INC} ${CFLAGS} -fno-fast-math -ffp-contract=off
+	${CXX} ${CXXFLAGS} ${RGFLAGS} ${DEPFLAGS} -o $@ -c $< ${INC} ${CFLAGS} -fno-fast-math -ffp-contract=off
 
 %.o: %.cpp
-	${CXX} ${CXXFLAGS} ${RGFLAGS} -o $@ -c $< ${INC} ${CFLAGS}
+	${CXX} ${CXXFLAGS} ${RGFLAGS} ${DEPFLAGS} -o $@ -c $< ${INC} ${CFLAGS}
+
+-include $(OBJECTS:.o=.d)
 
 libMvtnorm: 
 		(cd ./external_libs/mvtnorm/;$(MAKE))
@@ -205,7 +210,7 @@ debug: CXXFLAGS  = -O0 -g -std=c++11 -fPIC
 debug: ${EFILE}
 
 clean:
-	rm -f ${EFILE} ./src/*.o
+	rm -f ${EFILE} ./src/*.o ./src/*.d
 	(cd ./external_libs/mvtnorm/;$(MAKE) clean)
 	(cd ./external_libs/qf/;$(MAKE) clean)
 	(cd ./external_libs/quadpack/;$(MAKE) clean)
