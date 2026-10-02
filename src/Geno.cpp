@@ -28,6 +28,10 @@
 #include "Files.hpp"
 #include "Geno.hpp"
 #include "db/sqlite3.hpp"
+#include "bgen8_parse.hpp"
+#ifdef WITH_LIBDEFLATE
+#include "libdeflate.h"
+#endif
 
 using namespace std;
 using namespace Eigen;
@@ -2215,19 +2219,29 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
   string tmp_buffer;
 
   MapArXd Geno (gblock->Gmat.col(isnp).data(), params->n_samples, 1);
-  Geno = 0;
+  // common case handled by bgen8_parse_fast(), which writes every entry of Geno
+  bool non_par = in_non_par(chrom, infosnp->physpos, params);
+  bool fast_parse = !(params->test_mode && non_par) && !params->build_mask && !params->af_cc;
+  if(!fast_parse) Geno = 0;
   // reset variant info
   prep_snp_stats(snp_data, params);
 
-  // set genotype data block
-  vector < uchar > geno_block_uncompressed;
-  geno_block_uncompressed.resize(outsize);
+  // set genotype data block (one buffer per thread, reused across variants)
+  static thread_local vector < uchar > geno_block_uncompressed;
+  if(geno_block_uncompressed.size() < outsize) geno_block_uncompressed.resize(outsize);
 
   // uncompress the block
   bool compress_fail;
   if(params->zlib_compress){ // using zlib
+#ifdef WITH_LIBDEFLATE
+    // libdeflate decodes the same zlib stream (output is byte-identical) several times faster than zlib
+    static thread_local std::unique_ptr<libdeflate_decompressor, void(*)(libdeflate_decompressor*)> decompressor(libdeflate_alloc_decompressor(), libdeflate_free_decompressor);
+    size_t dest_size = 0;
+    compress_fail = (decompressor == nullptr) || (libdeflate_zlib_decompress(decompressor.get(), &((*geno_block)[0]), insize - 4, &(geno_block_uncompressed[0]), outsize, &dest_size) != LIBDEFLATE_SUCCESS) || (dest_size != outsize);
+#else
     uLongf dest_size = outsize;
     compress_fail = (uncompress( &(geno_block_uncompressed[0]), &dest_size, &((*geno_block)[0]), insize - 4) != Z_OK) || (dest_size != outsize);
+#endif
   } else { // using zstd
     size_t const dest_size = ZSTD_decompress(&(geno_block_uncompressed[0]), outsize, &((*geno_block)[0]), insize - 4) ;
     //cerr << outsize << " " << dest_size << " " << insize - 4 << endl;
@@ -2256,9 +2270,7 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
   buffer ++;
 
   //to identify missing when getting dosages
-  vector < uchar > ploidy_n;
-  ploidy_n.resize( nindivs );
-  std::memcpy(&(ploidy_n[0]), &(buffer[0]), nindivs);
+  const uchar* ploidy_n = buffer;
   buffer += nindivs;
 
   // phasing
@@ -2271,13 +2283,27 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
 
   // get dosages (can compute mean as going along (and identify non-zero entries if SPA is used)
   bool missing;
-  bool non_par = in_non_par(chrom, infosnp->physpos, params);
   int lval, ncarriers = 0, nmales = 0;
+  uint32_t n_missing = 0, n_out = 0;
   double prob0, prob1, prob2, total = 0, mac = 0, mval, ival, info_num = 0, sum_pos;
 
   // parse genotype probabilities block
   index = 0;
-  for(size_t i = 0; i < nindivs; i++) {
+  if( fast_parse ){
+    // same per-sample arithmetic and summation order as the loop below (see bgen8_parse.cpp)
+    struct trait_ctx { variant_block* snp_data; const Ref<const MatrixXb>* mask; } ctx = { snp_data, &masked_indivs };
+    bgen8_trait_counts_fn trait_counts = [](void* c, int ind, double gval, double ivalue) {
+      trait_ctx* t = static_cast<trait_ctx*>(c);
+      update_trait_counts(ind, gval, gval, 0, ivalue, t->snp_data, *(t->mask));
+    };
+    bgen8_parse_sums sums;
+    bgen8_parse_fast(buffer, ploidy_n, nindivs, filters->ind_ignore.data(), filters->ind_in_analysis.data(), filters->has_missing.data(), params->ref_first, !params->split_by_pheno, Geno.data(), sums, trait_counts, &ctx);
+    buffer += 2 * nindivs;
+    total = sums.total; mac = sums.mac; info_num = sums.info_num;
+    snp_data->ns1 += sums.ns1; snp_data->n_aa += sums.n_aa; snp_data->n_rr += sums.n_rr;
+    n_missing = sums.n_missing; n_out = sums.n_out;
+
+  } else for(size_t i = 0; i < nindivs; i++) {
 
     // skip samples that were ignored from the analysis
     if( filters->ind_ignore(i) ) {
@@ -2289,6 +2315,7 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
     if(missing) {
       // bug fix (with imputed data this case should not occur)
       Geno(index++) = -3;
+      n_missing++;
       buffer+=2;
       continue;
     }
@@ -2426,8 +2453,8 @@ void parseSnpfromBGEN(const int& isnp, const int &chrom, vector<uchar>* geno_blo
     }
   }
 
-  // impute missing
-  if(!params->build_mask)
+  // impute missing (a no-op when no dosage is missing and all samples are in the analysis)
+  if(!params->build_mask && ((n_missing > 0) || (fast_parse ? (n_out > 0) : !filters->ind_in_analysis.all())))
     mean_impute_g(total, Geno, filters->ind_in_analysis);
 
   return;

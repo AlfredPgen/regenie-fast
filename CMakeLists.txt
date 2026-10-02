@@ -115,8 +115,20 @@ add_executable(regenie
   ${CMAKE_SOURCE_DIR}/src/cox_ridge.cpp
   ${CMAKE_SOURCE_DIR}/src/cox_score.cpp
   ${CMAKE_SOURCE_DIR}/src/cox_firth.cpp
+  ${CMAKE_SOURCE_DIR}/src/bgen8_parse.cpp
   )
 target_include_directories(regenie PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# fast BGEN parsing must reproduce the per-sample arithmetic exactly: plain IEEE operations, no contraction
+set_source_files_properties(${CMAKE_SOURCE_DIR}/src/bgen8_parse.cpp PROPERTIES COMPILE_FLAGS "-fno-fast-math -ffp-contract=off")
+
+# libdeflate (optional): faster inflate of zlib-compressed BGEN genotype blocks
+find_library(DEFLATE_LIBRARY libdeflate.a)
+find_path(DEFLATE_INCLUDE_DIR libdeflate.h)
+if(DEFLATE_LIBRARY AND DEFLATE_INCLUDE_DIR)
+  target_compile_definitions(regenie PRIVATE WITH_LIBDEFLATE)
+  target_include_directories(regenie PRIVATE ${DEFLATE_INCLUDE_DIR})
+  target_link_libraries(regenie PRIVATE ${DEFLATE_LIBRARY})
+endif()
 
 set(CMAKE_CXX_FLAGS "-O3 -Wall -pedantic -ffast-math -Wno-unused-local-typedefs -Wno-deprecated-declarations -Wno-long-long -Wno-c11-extensions -fPIC")
 add_definitions(-DVERSION_NUMBER="${RG_VERSION}")

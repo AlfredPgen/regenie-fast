@@ -149,6 +149,10 @@ all: ${EFILE}
 ${EFILE}: libMvtnorm libqf libquad pgenlib remeta ${OBJECTS}
 	${CXX} ${CXXFLAGS} ${RGFLAGS} ${CFLAGS} -o ${EFILE} ${OBJECTS} ./external_libs/mvtnorm/libMvtnorm.a ./external_libs/qf/qf.a ./external_libs/quadpack/libquad.a ./external_libs/pgenlib/pgenlib.a ./external_libs/remeta/remeta.a ${LPATHS} ${LIBS}
 
+# fast BGEN parsing must reproduce the per-sample arithmetic exactly: plain IEEE operations, no contraction
+./src/bgen8_parse.o: ./src/bgen8_parse.cpp
+	${CXX} ${CXXFLAGS} ${RGFLAGS} -o $@ -c $< ${INC} ${CFLAGS} -fno-fast-math -ffp-contract=off
+
 %.o: %.cpp
 	${CXX} ${CXXFLAGS} ${RGFLAGS} -o $@ -c $< ${INC} ${CFLAGS}
 
